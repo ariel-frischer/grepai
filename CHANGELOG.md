@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agentic CLI Support**: Non-interactive CLI commands for AI agents and scripts
+  - New `grepai index` command: One-shot indexing that completes and exits (unlike `watch`)
+    - `grepai index`: Index codebase and print human-readable summary
+    - `grepai index --json`: Output JSON result with `files_indexed`, `chunks_created`, `files_removed`, `files_skipped`, `symbols_extracted`, `duration_ms`
+    - Deterministic, finite operation suitable for CI/CD and AI agent workflows
+    - Exit code 0 on success, non-zero with JSON error on failure
+  - Enhanced `grepai status` command with non-TTY output modes
+    - `grepai status --plain`: Human-readable text output (key: value format)
+    - `grepai status --json`: JSON output with `files_indexed`, `total_chunks`, `index_size_bytes`, `last_updated`, `provider`, `model`
+    - Interactive TUI remains the default when TTY is available
+    - Clear error message when running without TTY and without output flags
+    - Flags are mutually exclusive (`--plain` and `--json` cannot be combined)
+
 - **Adaptive Rate Limiting for OpenAI**: Intelligent rate limit handling that automatically optimizes parallelism
   - **Automatic parallelism adjustment**: Halves parallelism after consecutive 429 responses, gradually restores after successful requests
   - **Retry-After header support**: Uses OpenAI's Retry-After header for optimal retry timing when present

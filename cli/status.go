@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -11,19 +13,48 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/store"
+	"golang.org/x/term"
 )
+
+var (
+	statusPlain bool
+	statusJSON  bool
+)
+
+// StatusResultJSON is the JSON output structure for the status command
+type StatusResultJSON struct {
+	FilesIndexed   int    `json:"files_indexed"`
+	TotalChunks    int    `json:"total_chunks"`
+	IndexSizeBytes int64  `json:"index_size_bytes"`
+	LastUpdated    string `json:"last_updated"`
+	Provider       string `json:"provider"`
+	Model          string `json:"model"`
+}
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Display index status and browse indexed files",
 	Long: `Display statistics about the index and interactively browse indexed files.
 
-Navigation:
+By default, runs an interactive TUI for browsing the index (requires TTY).
+Use --plain or --json for non-interactive output suitable for AI agents and scripts.
+
+Navigation (interactive mode):
   Enter    - Browse files / View chunks
   Esc      - Go back
   Up/Down  - Navigate
-  q        - Quit`,
+  q        - Quit
+
+Examples:
+  grepai status              Interactive TUI (requires TTY)
+  grepai status --plain      Human-readable text output
+  grepai status --json       JSON output for AI agents`,
 	RunE: runStatus,
+}
+
+func init() {
+	statusCmd.Flags().BoolVar(&statusPlain, "plain", false, "Output human-readable text (no TUI, no TTY required)")
+	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output result in JSON format (for AI agents)")
 }
 
 type viewState int
@@ -300,6 +331,17 @@ func (m model) viewChunks() string {
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
+	// Validate mutually exclusive flags
+	if statusPlain && statusJSON {
+		return fmt.Errorf("flags --plain and --json are mutually exclusive")
+	}
+
+	// Check TTY requirement for interactive mode
+	isTTY := term.IsTerminal(int(os.Stdout.Fd()))
+	if !statusPlain && !statusJSON && !isTTY {
+		return fmt.Errorf("interactive status requires a terminal (TTY)\nUse --plain or --json for non-interactive output")
+	}
+
 	// Find project root
 	projectRoot, err := config.FindProjectRoot()
 	if err != nil {
@@ -349,7 +391,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get stats: %w", err)
 	}
 
-	// Get files
+	// Handle --json output
+	if statusJSON {
+		return outputStatusJSON(stats, cfg)
+	}
+
+	// Handle --plain output
+	if statusPlain {
+		return outputStatusPlain(stats, cfg)
+	}
+
+	// Get files for interactive TUI
 	files, err := st.ListFilesWithStats(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list files: %w", err)
@@ -373,6 +425,42 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err = p.Run()
 	return err
+}
+
+// outputStatusJSON outputs status in JSON format
+func outputStatusJSON(stats *store.IndexStats, cfg *config.Config) error {
+	lastUpdated := ""
+	if !stats.LastUpdated.IsZero() {
+		lastUpdated = stats.LastUpdated.Format("2006-01-02T15:04:05Z07:00")
+	}
+
+	result := StatusResultJSON{
+		FilesIndexed:   stats.TotalFiles,
+		TotalChunks:    stats.TotalChunks,
+		IndexSizeBytes: stats.IndexSize,
+		LastUpdated:    lastUpdated,
+		Provider:       cfg.Embedder.Provider,
+		Model:          cfg.Embedder.Model,
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+// outputStatusPlain outputs status in human-readable text format
+func outputStatusPlain(stats *store.IndexStats, cfg *config.Config) error {
+	fmt.Printf("files_indexed: %d\n", stats.TotalFiles)
+	fmt.Printf("total_chunks: %d\n", stats.TotalChunks)
+	fmt.Printf("index_size_bytes: %d\n", stats.IndexSize)
+	if stats.LastUpdated.IsZero() {
+		fmt.Printf("last_updated: never\n")
+	} else {
+		fmt.Printf("last_updated: %s\n", stats.LastUpdated.Format("2006-01-02T15:04:05Z07:00"))
+	}
+	fmt.Printf("provider: %s\n", cfg.Embedder.Provider)
+	fmt.Printf("model: %s\n", cfg.Embedder.Model)
+	return nil
 }
 
 func formatBytes(b int64) string {
