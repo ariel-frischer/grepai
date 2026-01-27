@@ -1,7 +1,7 @@
 .PHONY: build install test clean lint run docs docs-generate docs-build docs-dev fmt pre-commit
 
 BINARY_NAME=grepai
-VERSION?=0.1.0
+VERSION?=0.1.2
 BUILD_DIR=bin
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
