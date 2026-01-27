@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Retry attempts displayed to user: "Retrying batch N (attempt X/5)..."
   - Atomic indexing: all batches succeed or entire operation fails cleanly
   - Ollama embedder unchanged (local, already fast)
+- **Adaptive Rate Limiting for OpenAI**: Auto-adjusts parallelism based on 429 responses, respects Retry-After headers, optional TPM pacing via `WithOpenAITPMLimit`
+- **Parallel OpenAI Embedding**: 3x+ faster indexing with batched API requests and configurable parallelism (`embedder.parallelism`, default: 4)
 
 ## [0.23.0] - 2026-01-25
 
