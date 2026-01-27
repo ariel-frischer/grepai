@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/yoanbernabeu/grepai/indexer"
 )
 
 func skipIfWindows(t *testing.T) {
@@ -288,4 +289,157 @@ func TestStopWatchDaemon_WaitForShutdown(t *testing.T) {
 			t.Error("PID file was not removed after stop")
 		}
 	}
+}
+
+func TestIsTracedLanguage(t *testing.T) {
+	tests := []struct {
+		name             string
+		ext              string
+		enabledLanguages []string
+		expected         bool
+	}{
+		{
+			name:             "go file in list",
+			ext:              ".go",
+			enabledLanguages: []string{".go", ".js", ".ts"},
+			expected:         true,
+		},
+		{
+			name:             "py file not in list",
+			ext:              ".py",
+			enabledLanguages: []string{".go", ".js", ".ts"},
+			expected:         false,
+		},
+		{
+			name:             "exact match required",
+			ext:              ".tsx",
+			enabledLanguages: []string{".ts"},
+			expected:         false,
+		},
+		{
+			name:             "empty list",
+			ext:              ".go",
+			enabledLanguages: []string{},
+			expected:         false,
+		},
+		{
+			name:             "single element list match",
+			ext:              ".py",
+			enabledLanguages: []string{".py"},
+			expected:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isTracedLanguage(tt.ext, tt.enabledLanguages)
+			if result != tt.expected {
+				t.Errorf("isTracedLanguage(%q, %v) = %v, want %v", tt.ext, tt.enabledLanguages, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDescribeRetryReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		expected   string
+	}{
+		{
+			name:       "rate limited 429",
+			statusCode: 429,
+			expected:   "Rate limited (429)",
+		},
+		{
+			name:       "server error 500",
+			statusCode: 500,
+			expected:   "Server error (500)",
+		},
+		{
+			name:       "server error 503",
+			statusCode: 503,
+			expected:   "Server error (503)",
+		},
+		{
+			name:       "server error 599",
+			statusCode: 599,
+			expected:   "Server error (599)",
+		},
+		{
+			name:       "other HTTP error 400",
+			statusCode: 400,
+			expected:   "HTTP error (400)",
+		},
+		{
+			name:       "zero status code",
+			statusCode: 0,
+			expected:   "Error",
+		},
+		{
+			name:       "negative status code",
+			statusCode: -1,
+			expected:   "Error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := describeRetryReason(tt.statusCode)
+			if result != tt.expected {
+				t.Errorf("describeRetryReason(%d) = %q, want %q", tt.statusCode, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPrintProgress(t *testing.T) {
+	// Test with total=0 (edge case - should return early)
+	printProgress(1, 0, "test.go")
+
+	// Test normal case
+	printProgress(5, 10, "short.go")
+
+	// Test with long file path (should be truncated)
+	longPath := "/very/long/path/to/some/deeply/nested/file/that/exceeds/the/maximum/length.go"
+	printProgress(1, 10, longPath)
+
+	// Test at 100%
+	printProgress(10, 10, "done.go")
+}
+
+func TestPrintBatchProgress(t *testing.T) {
+	// Test retrying case
+	info := indexer.BatchProgressInfo{
+		BatchIndex: 0,
+		Retrying:   true,
+		StatusCode: 429,
+		Attempt:    2,
+	}
+	printBatchProgress(info)
+
+	// Test retrying with server error
+	info2 := indexer.BatchProgressInfo{
+		BatchIndex: 1,
+		Retrying:   true,
+		StatusCode: 500,
+		Attempt:    3,
+	}
+	printBatchProgress(info2)
+
+	// Test normal progress
+	info3 := indexer.BatchProgressInfo{
+		CompletedChunks: 50,
+		TotalChunks:     100,
+		Retrying:        false,
+	}
+	printBatchProgress(info3)
+
+	// Test with zero total chunks (edge case)
+	info4 := indexer.BatchProgressInfo{
+		CompletedChunks: 0,
+		TotalChunks:     0,
+		Retrying:        false,
+	}
+	printBatchProgress(info4)
 }

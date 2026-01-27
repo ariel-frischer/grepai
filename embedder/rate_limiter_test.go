@@ -404,3 +404,111 @@ func TestTokenBucket_ConcurrentAccess(t *testing.T) {
 		t.Errorf("TokensAvailable() = %d, want %d", available, expected)
 	}
 }
+
+func TestTokenBucket_TokensAvailableNeverNegative(t *testing.T) {
+	tb := embedder.NewTokenBucket(100)
+
+	// Exceed the limit
+	tb.AddTokens(200)
+
+	// Should return 0, not negative
+	available := tb.TokensAvailable()
+	if available != 0 {
+		t.Errorf("TokensAvailable() = %d, want 0 when exhausted", available)
+	}
+}
+
+func TestTokenBucket_AddTokensAlwaysReturnsTrue(t *testing.T) {
+	tb := embedder.NewTokenBucket(100)
+
+	// AddTokens should always return true (it tracks usage, doesn't limit)
+	result := tb.AddTokens(50)
+	if !result {
+		t.Error("AddTokens() should return true")
+	}
+
+	// Even when exceeding limit
+	result = tb.AddTokens(100)
+	if !result {
+		t.Error("AddTokens() should return true even when exceeding limit")
+	}
+}
+
+func TestTokenBucket_WaitForTokens_WindowReset(t *testing.T) {
+	tb := embedder.NewTokenBucket(100)
+
+	// Use all tokens
+	tb.AddTokens(100)
+
+	// Should need to wait
+	wait := tb.WaitForTokens(10)
+	if wait <= 0 {
+		t.Error("expected wait > 0 when tokens exhausted")
+	}
+
+	// Wait should be <= 60 seconds (one window)
+	if wait > 61*time.Second {
+		t.Errorf("wait = %v, should be <= 61s", wait)
+	}
+}
+
+func TestAdaptiveRateLimiter_MultipleReductions(t *testing.T) {
+	arl := embedder.NewAdaptiveRateLimiter(8)
+
+	// First reduction: 8 -> 4
+	for i := 0; i < 3; i++ {
+		arl.OnRateLimitHit()
+	}
+	if arl.CurrentWorkers() != 4 {
+		t.Errorf("expected 4 workers after first reduction, got %d", arl.CurrentWorkers())
+	}
+
+	// Second reduction: 4 -> 2
+	for i := 0; i < 3; i++ {
+		arl.OnRateLimitHit()
+	}
+	if arl.CurrentWorkers() != 2 {
+		t.Errorf("expected 2 workers after second reduction, got %d", arl.CurrentWorkers())
+	}
+
+	// Third reduction: 2 -> 1
+	for i := 0; i < 3; i++ {
+		arl.OnRateLimitHit()
+	}
+	if arl.CurrentWorkers() != 1 {
+		t.Errorf("expected 1 worker after third reduction, got %d", arl.CurrentWorkers())
+	}
+}
+
+func TestAdaptiveRateLimiter_GradualRestoration(t *testing.T) {
+	arl := embedder.NewAdaptiveRateLimiter(5)
+
+	// Reduce to 1
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 3; j++ {
+			arl.OnRateLimitHit()
+		}
+	}
+
+	if arl.CurrentWorkers() != 1 {
+		t.Fatalf("expected 1 worker after reductions, got %d", arl.CurrentWorkers())
+	}
+
+	// Gradually restore: 1 -> 2 -> 3 -> 4 -> 5
+	for target := 2; target <= 5; target++ {
+		for i := 0; i < 10; i++ {
+			arl.OnSuccess()
+		}
+		if arl.CurrentWorkers() != target {
+			t.Errorf("expected %d workers after restoration, got %d", target, arl.CurrentWorkers())
+		}
+	}
+
+	// Further successes should not exceed max
+	for i := 0; i < 20; i++ {
+		arl.OnSuccess()
+	}
+	if arl.CurrentWorkers() != 5 {
+		t.Errorf("expected 5 workers (max), got %d", arl.CurrentWorkers())
+	}
+}

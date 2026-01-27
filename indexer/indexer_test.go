@@ -2,8 +2,10 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -985,4 +987,98 @@ func TestWrapBatchProgress(t *testing.T) {
 			t.Errorf("StatusCode = %d, expected 429", receivedInfo.StatusCode)
 		}
 	})
+}
+
+// mockBatchEmbedderWithError implements embedder.BatchEmbedder that returns an error
+type mockBatchEmbedderWithError struct {
+	embedCalled bool
+}
+
+func (m *mockBatchEmbedderWithError) Embed(ctx context.Context, text string) ([]float32, error) {
+	m.embedCalled = true
+	return nil, fmt.Errorf("embedding error")
+}
+
+func (m *mockBatchEmbedderWithError) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	m.embedCalled = true
+	return nil, fmt.Errorf("batch embedding error")
+}
+
+func (m *mockBatchEmbedderWithError) Dimensions() int {
+	return 3
+}
+
+func (m *mockBatchEmbedderWithError) Close() error {
+	return nil
+}
+
+func (m *mockBatchEmbedderWithError) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
+	m.embedCalled = true
+	return nil, fmt.Errorf("batch embedder error")
+}
+
+// TestIndexFilesBatched_EmbedderError tests that embedder errors are propagated correctly
+func TestIndexFilesBatched_EmbedderError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create test file
+	testFile := filepath.Join(tmpDir, "test.go")
+	content := "package main\n\nfunc main() { /* some content */ }"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	mockStore := newMockStore()
+	mockEmb := &mockBatchEmbedderWithError{}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	// Index should fail due to embedder error
+	_, err = indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
+	if err == nil {
+		t.Fatal("expected error from embedder, got nil")
+	}
+
+	// Verify error message contains our error
+	if !strings.Contains(err.Error(), "batch embedder error") {
+		t.Errorf("expected error to contain 'batch embedder error', got: %v", err)
+	}
+}
+
+// TestIndexAllWithBatchProgress_NilBatchProgress tests that nil batch progress callback works
+func TestIndexAllWithBatchProgress_NilBatchProgress(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "test.go")
+	content := "package main\n\nfunc main() {}"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	mockStore := newMockStore()
+	mockEmb := newMockBatchEmbedder()
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
+
+	// Should not panic with nil progress callbacks
+	stats, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+	}
+
+	if stats.FilesIndexed != 1 {
+		t.Errorf("expected 1 file indexed, got %d", stats.FilesIndexed)
+	}
 }
