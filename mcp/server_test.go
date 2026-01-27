@@ -258,3 +258,57 @@ func TestRegisterTools_IndexStatusSchema(t *testing.T) {
 		t.Fatalf("expected verbose type boolean, got %v", propMap["type"])
 	}
 }
+
+// TestFormatBytes tests the formatBytes helper function
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		name     string
+		bytes    int64
+		expected string
+	}{
+		{
+			name:     "zero bytes",
+			bytes:    0,
+			expected: "N/A",
+		},
+		{
+			name:     "small bytes",
+			bytes:    100,
+			expected: "100 B",
+		},
+		{
+			name:     "exactly 1 KB",
+			bytes:    1024,
+			expected: "1.0 KB",
+		},
+		{
+			name:     "1.5 KB",
+			bytes:    1536,
+			expected: "1.5 KB",
+		},
+		{
+			name:     "1 MB",
+			bytes:    1024 * 1024,
+			expected: "1.0 MB",
+		},
+		{
+			name:     "1 GB",
+			bytes:    1024 * 1024 * 1024,
+			expected: "1.0 GB",
+		},
+		{
+			name:     "1.5 GB",
+			bytes:    1024 * 1024 * 1024 * 3 / 2,
+			expected: "1.5 GB",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := formatBytes(tt.bytes)
+			if result != tt.expected {
+				t.Errorf("formatBytes(%d) = %q, want %q", tt.bytes, result, tt.expected)
+			}
+		})
+	}
+}

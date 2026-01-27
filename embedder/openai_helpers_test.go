@@ -397,3 +397,82 @@ func TestParseEmbeddingsResponse_InvalidJSON(t *testing.T) {
 		t.Error("expected error for invalid JSON")
 	}
 }
+
+func TestEmbedBatchRequest_EmptyInput(t *testing.T) {
+	e := &OpenAIEmbedder{
+		endpoint:   "https://api.example.com/v1",
+		model:      "text-embedding-3-small",
+		apiKey:     "test-api-key",
+		dimensions: 512,
+	}
+
+	ctx := context.Background()
+	embeddings, err := e.embedBatchRequest(ctx, []string{})
+	if err != nil {
+		t.Fatalf("unexpected error for empty input: %v", err)
+	}
+	if embeddings != nil {
+		t.Errorf("expected nil embeddings for empty input, got %v", embeddings)
+	}
+}
+
+func TestReportBatchSuccess_WithTokenBucket(t *testing.T) {
+	var completed atomic.Int64
+	bucket := NewTokenBucket(100000)
+	limiter := NewAdaptiveRateLimiter(4)
+
+	e := &OpenAIEmbedder{
+		tokenBucket: bucket,
+		rateLimiter: limiter,
+	}
+
+	batch := Batch{
+		Index:   0,
+		Entries: []BatchEntry{{Content: "test content"}},
+	}
+
+	initialAvailable := bucket.TokensAvailable()
+	e.reportBatchSuccess(batch, 1, 1, &completed, 100, nil)
+
+	// Token bucket should have recorded the tokens
+	newAvailable := bucket.TokensAvailable()
+	if newAvailable != initialAvailable-100 {
+		t.Errorf("expected available tokens to decrease by 100, got %d -> %d", initialAvailable, newAvailable)
+	}
+}
+
+func TestCalculateRetryDelay_NilRateLimitHeaders(t *testing.T) {
+	policy := RetryPolicy{BaseDelay: 100 * time.Millisecond, Multiplier: 2.0}
+	e := &OpenAIEmbedder{retryPolicy: policy}
+
+	retryErr := &RetryableError{
+		RateLimitHeaders: nil,
+	}
+
+	delay := e.calculateRetryDelay(1, retryErr)
+	// Should use exponential backoff
+	expected := policy.Calculate(1)
+	if delay != expected {
+		t.Errorf("expected %v from exponential backoff, got %v", expected, delay)
+	}
+}
+
+func TestHandleEmbedErrorResponse_ServerError(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{},
+	}
+	body := []byte(`{"error": {"message": "Service unavailable", "type": "server_error"}}`)
+
+	retryErr := handleEmbedErrorResponse(resp, body)
+
+	if retryErr.StatusCode != 503 {
+		t.Errorf("expected status 503, got %d", retryErr.StatusCode)
+	}
+	if !retryErr.Retryable {
+		t.Error("expected 503 to be retryable")
+	}
+	if retryErr.RateLimitHeaders != nil {
+		t.Error("expected no rate limit headers for 503")
+	}
+}
