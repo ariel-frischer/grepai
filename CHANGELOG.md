@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Non-Interactive Init**: Flags for `grepai init` to support CI/scripts/AI agents
+  - `--yes`: Use defaults without prompting (ollama + gob)
+  - `-m, --model`: Override embedding model (e.g., `--model text-embedding-3-large`)
+  - `--postgres-dsn`: PostgreSQL DSN (required for postgres backend in non-interactive mode)
+  - `--qdrant-endpoint`, `--qdrant-port`, `--qdrant-tls`, `--qdrant-api-key`, `--qdrant-collection`: Qdrant configuration
+  - Examples:
+    - `grepai init --yes` (defaults)
+    - `grepai init --yes --provider openai --model text-embedding-3-large`
+    - `grepai init --yes --backend postgres --postgres-dsn "postgres://..."`
+
 - **Agentic CLI Support**: Non-interactive CLI commands for AI agents and scripts
   - New `grepai index` command: One-shot indexing that completes and exits (unlike `watch`)
     - `grepai index`: Index codebase and print human-readable summary

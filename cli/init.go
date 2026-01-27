@@ -13,14 +13,38 @@ import (
 
 var (
 	initProvider       string
+	initModel          string
 	initBackend        string
 	initNonInteractive bool
+	// Backend-specific flags
+	initPostgresDSN      string
+	initQdrantEndpoint   string
+	initQdrantPort       int
+	initQdrantUseTLS     bool
+	initQdrantAPIKey     string
+	initQdrantCollection string
 )
 
 const (
 	openAI3SmallDimensions      = 1536
 	lmStudioEmbeddingDimensions = 768
 )
+
+// applyProviderConfig sets provider-specific configuration defaults
+func applyProviderConfig(cfg *config.Config, provider string) {
+	cfg.Embedder.Provider = provider
+	switch provider {
+	case "lmstudio":
+		cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
+		cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
+		cfg.Embedder.Dimensions = lmStudioEmbeddingDimensions
+	case "openai":
+		cfg.Embedder.Model = "text-embedding-3-small"
+		cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+		cfg.Embedder.Dimensions = openAI3SmallDimensions
+	// ollama uses defaults from config.DefaultConfig()
+	}
+}
 
 var initCmd = &cobra.Command{
 	Use:   "init",
@@ -29,16 +53,42 @@ var initCmd = &cobra.Command{
 
 This command will:
 - Create .grepai/config.yaml with default settings
-- Prompt for embedding provider (Ollama or OpenAI)
-- Prompt for storage backend (GOB file or PostgreSQL)
-- Add .grepai/ to .gitignore if present`,
+- Prompt for embedding provider (Ollama, LM Studio, or OpenAI)
+- Prompt for storage backend (GOB file, PostgreSQL, or Qdrant)
+- Add .grepai/ to .gitignore if present
+
+For non-interactive use (CI/scripts/AI agents), use --yes with provider/backend flags:
+
+  # Use defaults (ollama + gob)
+  grepai init --yes
+
+  # Use OpenAI with default model
+  grepai init --yes --provider openai
+
+  # Use OpenAI with specific model
+  grepai init --yes --provider openai --model text-embedding-3-large
+
+  # Use PostgreSQL backend
+  grepai init --yes --backend postgres --postgres-dsn "postgres://user:pass@localhost/db"
+
+  # Use Qdrant backend
+  grepai init --yes --backend qdrant --qdrant-endpoint localhost --qdrant-port 6334`,
 	RunE: runInit,
 }
 
 func init() {
 	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, or openai)")
+	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (overrides provider default)")
 	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
 	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
+
+	// Backend-specific flags
+	initCmd.Flags().StringVar(&initPostgresDSN, "postgres-dsn", "", "PostgreSQL connection string (required for postgres backend)")
+	initCmd.Flags().StringVar(&initQdrantEndpoint, "qdrant-endpoint", "localhost", "Qdrant server endpoint")
+	initCmd.Flags().IntVar(&initQdrantPort, "qdrant-port", 6334, "Qdrant server port")
+	initCmd.Flags().BoolVar(&initQdrantUseTLS, "qdrant-tls", false, "Use TLS for Qdrant connection")
+	initCmd.Flags().StringVar(&initQdrantAPIKey, "qdrant-api-key", "", "Qdrant API key (for Qdrant Cloud)")
+	initCmd.Flags().StringVar(&initQdrantCollection, "qdrant-collection", "", "Qdrant collection name (defaults to sanitized project path)")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -73,30 +123,18 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 			switch input {
 			case "2", "lmstudio":
-				cfg.Embedder.Provider = "lmstudio"
-				cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
-				cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
-				cfg.Embedder.Dimensions = lmStudioEmbeddingDimensions
+				applyProviderConfig(cfg, "lmstudio")
 			case "3", "openai":
-				cfg.Embedder.Provider = "openai"
-				cfg.Embedder.Model = "text-embedding-3-small"
-				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
-				cfg.Embedder.Dimensions = openAI3SmallDimensions
+				applyProviderConfig(cfg, "openai")
 			default:
-				cfg.Embedder.Provider = "ollama"
+				applyProviderConfig(cfg, "ollama")
 			}
 		} else {
-			cfg.Embedder.Provider = initProvider
-			switch initProvider {
-			case "lmstudio":
-				cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
-				cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
-				cfg.Embedder.Dimensions = lmStudioEmbeddingDimensions
-			case "openai":
-				cfg.Embedder.Model = "text-embedding-3-small"
-				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
-				cfg.Embedder.Dimensions = openAI3SmallDimensions
-			}
+			applyProviderConfig(cfg, initProvider)
+		}
+		// Apply model override if specified
+		if initModel != "" {
+			cfg.Embedder.Model = initModel
 		}
 
 		// Backend selection
@@ -159,12 +197,29 @@ func runInit(cmd *cobra.Command, args []string) error {
 			cfg.Store.Backend = initBackend
 		}
 	} else {
-		// Non-interactive with flags
+		// Non-interactive mode
 		if initProvider != "" {
-			cfg.Embedder.Provider = initProvider
+			applyProviderConfig(cfg, initProvider)
+		}
+		// Apply model override if specified
+		if initModel != "" {
+			cfg.Embedder.Model = initModel
 		}
 		if initBackend != "" {
 			cfg.Store.Backend = initBackend
+			switch initBackend {
+			case "postgres":
+				if initPostgresDSN == "" {
+					return fmt.Errorf("--postgres-dsn is required when using postgres backend in non-interactive mode")
+				}
+				cfg.Store.Postgres.DSN = initPostgresDSN
+			case "qdrant":
+				cfg.Store.Qdrant.Endpoint = initQdrantEndpoint
+				cfg.Store.Qdrant.Port = initQdrantPort
+				cfg.Store.Qdrant.UseTLS = initQdrantUseTLS
+				cfg.Store.Qdrant.APIKey = initQdrantAPIKey
+				cfg.Store.Qdrant.Collection = initQdrantCollection
+			}
 		}
 	}
 
