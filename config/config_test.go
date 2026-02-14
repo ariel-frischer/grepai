@@ -26,8 +26,8 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("expected model nomic-embed-text, got %s", cfg.Embedder.Model)
 	}
 
-	if cfg.Embedder.Dimensions != 768 {
-		t.Errorf("expected dimensions 768, got %d", cfg.Embedder.Dimensions)
+	if cfg.Embedder.Dimensions == nil || *cfg.Embedder.Dimensions != 768 {
+		t.Errorf("expected dimensions 768, got %v", cfg.Embedder.Dimensions)
 	}
 
 	if cfg.Store.Backend != "gob" {
@@ -45,6 +45,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Watch.DebounceMs != 500 {
 		t.Errorf("expected debounce 500ms, got %d", cfg.Watch.DebounceMs)
 	}
+	if cfg.Watch.RPGPersistIntervalMs != DefaultWatchRPGPersistIntervalMs {
+		t.Errorf("expected watch.rpg_persist_interval_ms=%d, got %d", DefaultWatchRPGPersistIntervalMs, cfg.Watch.RPGPersistIntervalMs)
+	}
+	if cfg.Watch.RPGDerivedDebounceMs != DefaultWatchRPGDerivedDebounceMs {
+		t.Errorf("expected watch.rpg_derived_debounce_ms=%d, got %d", DefaultWatchRPGDerivedDebounceMs, cfg.Watch.RPGDerivedDebounceMs)
+	}
+	if cfg.Watch.RPGFullReconcileIntervalSec != DefaultWatchRPGFullReconcileIntervalS {
+		t.Errorf("expected watch.rpg_full_reconcile_interval_sec=%d, got %d", DefaultWatchRPGFullReconcileIntervalS, cfg.Watch.RPGFullReconcileIntervalSec)
+	}
+	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
+		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
 }
 
 func TestConfigSaveAndLoad(t *testing.T) {
@@ -52,7 +64,8 @@ func TestConfigSaveAndLoad(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Embedder.Provider = "openai"
-	cfg.Embedder.Dimensions = dimensions
+	dim := dimensions
+	cfg.Embedder.Dimensions = &dim
 	cfg.Embedder.Endpoint = endpoints
 	cfg.Store.Backend = "postgres"
 
@@ -77,8 +90,8 @@ func TestConfigSaveAndLoad(t *testing.T) {
 		t.Errorf("expected provider openai, got %s", loaded.Embedder.Provider)
 	}
 
-	if loaded.Embedder.Dimensions != dimensions {
-		t.Errorf("expected dimensions %d, got %d", dimensions, loaded.Embedder.Dimensions)
+	if loaded.Embedder.Dimensions == nil || *loaded.Embedder.Dimensions != dimensions {
+		t.Errorf("expected dimensions %d, got %v", dimensions, loaded.Embedder.Dimensions)
 	}
 
 	if loaded.Store.Backend != "postgres" {
@@ -234,6 +247,65 @@ store:
 	}
 }
 
+// TestFindProjectRootWithSymlink verifies that FindProjectRoot resolves symlinks correctly.
+func TestFindProjectRootWithSymlink(t *testing.T) {
+	// Create a real directory with grepai config
+	realDir := t.TempDir()
+	configDir := filepath.Join(realDir, ConfigDir)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	if err := cfg.Save(realDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Create a symlink to the real directory
+	symlinkParent := t.TempDir()
+	symlinkPath := filepath.Join(symlinkParent, "symlink-project")
+	if err := os.Symlink(realDir, symlinkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Save original working directory
+	originalWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get original working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(originalWd); err != nil {
+			t.Logf("warning: failed to restore working directory: %v", err)
+		}
+	}()
+
+	// Change to the symlink directory
+	if err := os.Chdir(symlinkPath); err != nil {
+		t.Fatalf("failed to change to symlink directory: %v", err)
+	}
+
+	// Call FindProjectRoot - it should return the resolved (real) path
+	projectRoot, err := FindProjectRoot()
+	if err != nil {
+		t.Fatalf("FindProjectRoot failed: %v", err)
+	}
+
+	// Resolve realDir for comparison (in case it contains symlinks itself)
+	expectedPath, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatalf("failed to resolve expected path: %v", err)
+	}
+
+	if projectRoot != expectedPath {
+		t.Errorf("expected resolved path %s, got %s", expectedPath, projectRoot)
+	}
+
+	// Verify the returned path is not the symlink path
+	if projectRoot == symlinkPath {
+		t.Error("FindProjectRoot returned symlink path instead of resolved path")
+	}
+}
+
 // TestBackwardCompatibility verifies that old configs without dimensions/endpoint
 // still work correctly by applying sensible defaults.
 func TestBackwardCompatibility(t *testing.T) {
@@ -332,8 +404,217 @@ store:
 				t.Errorf("expected endpoint %s, got %s", tt.expectedEndpoint, loaded.Embedder.Endpoint)
 			}
 
-			if loaded.Embedder.Dimensions != tt.expectedDimensions {
-				t.Errorf("expected dimensions %d, got %d", tt.expectedDimensions, loaded.Embedder.Dimensions)
+			if loaded.Embedder.GetDimensions() != tt.expectedDimensions {
+				t.Errorf("expected dimensions %d, got %d", tt.expectedDimensions, loaded.Embedder.GetDimensions())
+			}
+		})
+	}
+}
+
+// TestDimensionsPointerBehavior verifies the *int dimension behavior (issue #91).
+func TestDimensionsPointerBehavior(t *testing.T) {
+	tests := []struct {
+		name               string
+		configYAML         string
+		expectedNil        bool
+		expectedDimensions int
+	}{
+		{
+			name: "openai without dimensions leaves Dimensions nil",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedNil:        true,
+			expectedDimensions: 1536, // GetDimensions() returns default
+		},
+		{
+			name: "openai with explicit dimensions sets pointer",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  dimensions: 512
+store:
+  backend: gob
+`,
+			expectedNil:        false,
+			expectedDimensions: 512,
+		},
+		{
+			name: "ollama without dimensions gets default pointer",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+`,
+			expectedNil:        false,
+			expectedDimensions: 768,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if tt.expectedNil {
+				if loaded.Embedder.Dimensions != nil {
+					t.Errorf("expected nil Dimensions, got %d", *loaded.Embedder.Dimensions)
+				}
+			} else {
+				if loaded.Embedder.Dimensions == nil {
+					t.Error("expected non-nil Dimensions, got nil")
+				} else if *loaded.Embedder.Dimensions != tt.expectedDimensions {
+					t.Errorf("expected Dimensions=%d, got %d", tt.expectedDimensions, *loaded.Embedder.Dimensions)
+				}
+			}
+
+			// GetDimensions() should always return the expected value
+			if loaded.Embedder.GetDimensions() != tt.expectedDimensions {
+				t.Errorf("GetDimensions() expected %d, got %d", tt.expectedDimensions, loaded.Embedder.GetDimensions())
+			}
+		})
+	}
+}
+
+func TestValidateRPGConfig_FeatureGroupStrategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy string
+		wantErr  bool
+	}{
+		{"sample is valid", "sample", false},
+		{"split is valid", "split", false},
+		{"empty is invalid", "", true},
+		{"unknown is invalid", "random", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := RPGConfig{
+				DriftThreshold:       DefaultRPGDriftThreshold,
+				MaxTraversalDepth:    DefaultRPGMaxTraversalDepth,
+				FeatureMode:          DefaultRPGFeatureMode,
+				FeatureGroupStrategy: tt.strategy,
+			}
+			err := ValidateRPGConfig(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateRPGConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyDefaults_FeatureGroupStrategy(t *testing.T) {
+	// When FeatureGroupStrategy is empty, applyDefaults should set it to "sample"
+	cfg := &Config{}
+	cfg.applyDefaults()
+	if cfg.RPG.FeatureGroupStrategy != DefaultRPGFeatureGroupStrategy {
+		t.Errorf("expected FeatureGroupStrategy=%q, got %q", DefaultRPGFeatureGroupStrategy, cfg.RPG.FeatureGroupStrategy)
+	}
+}
+
+func TestApplyDefaults_WatchRealtimeFields(t *testing.T) {
+	cfg := &Config{}
+	cfg.applyDefaults()
+
+	if cfg.Watch.RPGPersistIntervalMs != DefaultWatchRPGPersistIntervalMs {
+		t.Errorf("expected watch.rpg_persist_interval_ms=%d, got %d", DefaultWatchRPGPersistIntervalMs, cfg.Watch.RPGPersistIntervalMs)
+	}
+	if cfg.Watch.RPGDerivedDebounceMs != DefaultWatchRPGDerivedDebounceMs {
+		t.Errorf("expected watch.rpg_derived_debounce_ms=%d, got %d", DefaultWatchRPGDerivedDebounceMs, cfg.Watch.RPGDerivedDebounceMs)
+	}
+	if cfg.Watch.RPGFullReconcileIntervalSec != DefaultWatchRPGFullReconcileIntervalS {
+		t.Errorf("expected watch.rpg_full_reconcile_interval_sec=%d, got %d", DefaultWatchRPGFullReconcileIntervalS, cfg.Watch.RPGFullReconcileIntervalSec)
+	}
+	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
+		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
+}
+
+func TestValidateWatchConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     WatchConfig
+		wantErr bool
+	}{
+		{
+			name: "valid config",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: false,
+		},
+		{
+			name: "persist interval too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        199,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "derived debounce too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        99,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "full reconcile interval too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 29,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "max dirty files too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    0,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateWatchConfig(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateWatchConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

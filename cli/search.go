@@ -7,9 +7,11 @@ import (
 	"os"
 	"strings"
 
+	"github.com/alpkeskin/gotoon"
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/search"
 	"github.com/yoanbernabeu/grepai/store"
 )
@@ -17,6 +19,7 @@ import (
 var (
 	searchLimit     int
 	searchJSON      bool
+	searchTOON      bool
 	searchCompact   bool
 	searchWorkspace string
 	searchProjects  []string
@@ -24,19 +27,23 @@ var (
 
 // SearchResultJSON is a lightweight struct for JSON output (excludes vector, hash, updated_at)
 type SearchResultJSON struct {
-	FilePath  string  `json:"file_path"`
-	StartLine int     `json:"start_line"`
-	EndLine   int     `json:"end_line"`
-	Score     float32 `json:"score"`
-	Content   string  `json:"content"`
+	FilePath    string  `json:"file_path"`
+	StartLine   int     `json:"start_line"`
+	EndLine     int     `json:"end_line"`
+	Score       float32 `json:"score"`
+	Content     string  `json:"content"`
+	FeaturePath string  `json:"feature_path,omitempty"`
+	SymbolName  string  `json:"symbol_name,omitempty"`
 }
 
 // SearchResultCompactJSON is a minimal struct for compact JSON output (no content field)
 type SearchResultCompactJSON struct {
-	FilePath  string  `json:"file_path"`
-	StartLine int     `json:"start_line"`
-	EndLine   int     `json:"end_line"`
-	Score     float32 `json:"score"`
+	FilePath    string  `json:"file_path"`
+	StartLine   int     `json:"start_line"`
+	EndLine     int     `json:"end_line"`
+	Score       float32 `json:"score"`
+	FeaturePath string  `json:"feature_path,omitempty"`
+	SymbolName  string  `json:"symbol_name,omitempty"`
 }
 
 var searchCmd = &cobra.Command{
@@ -55,9 +62,54 @@ The search will:
 func init() {
 	searchCmd.Flags().IntVarP(&searchLimit, "limit", "n", 10, "Maximum number of results to return")
 	searchCmd.Flags().BoolVarP(&searchJSON, "json", "j", false, "Output results in JSON format (for AI agents)")
-	searchCmd.Flags().BoolVarP(&searchCompact, "compact", "c", false, "Output minimal JSON without content (requires --json)")
+	searchCmd.Flags().BoolVarP(&searchTOON, "toon", "t", false, "Output results in TOON format (token-efficient for AI agents)")
+	searchCmd.Flags().BoolVarP(&searchCompact, "compact", "c", false, "Output minimal format without content (requires --json or --toon)")
 	searchCmd.Flags().StringVar(&searchWorkspace, "workspace", "", "Workspace name for cross-project search")
 	searchCmd.Flags().StringArrayVar(&searchProjects, "project", nil, "Project name(s) to search (requires --workspace, can be repeated)")
+	searchCmd.MarkFlagsMutuallyExclusive("json", "toon")
+}
+
+// rpgEnrichment holds RPG context for a search result
+type rpgEnrichment struct {
+	FeaturePath string
+	SymbolName  string
+}
+
+// enrichWithRPG enriches search results with RPG feature paths and symbol names
+func enrichWithRPG(projectRoot string, cfg *config.Config, results []store.SearchResult) []rpgEnrichment {
+	enrichments := make([]rpgEnrichment, len(results))
+	if !cfg.RPG.Enabled {
+		return enrichments
+	}
+
+	ctx := context.Background()
+	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
+	if err := rpgStore.Load(ctx); err != nil {
+		// Silently fail - RPG enrichment is best-effort
+		return enrichments
+	}
+	defer rpgStore.Close()
+
+	graph := rpgStore.GetGraph()
+	qe := rpg.NewQueryEngine(graph)
+
+	for i, r := range results {
+		nodes := graph.GetNodesByFile(r.Chunk.FilePath)
+		for _, n := range nodes {
+			// Find symbol node that overlaps with the chunk's line range
+			if n.Kind == rpg.KindSymbol && n.StartLine <= r.Chunk.EndLine && r.Chunk.StartLine <= n.EndLine {
+				// Found overlapping symbol node
+				fetchResult, err := qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+				if err == nil && fetchResult != nil {
+					enrichments[i].FeaturePath = fetchResult.FeaturePath
+					enrichments[i].SymbolName = n.SymbolName
+				}
+				break
+			}
+		}
+	}
+
+	return enrichments
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {
@@ -65,8 +117,8 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
 	// Validate flag combination
-	if searchCompact && !searchJSON {
-		return fmt.Errorf("--compact flag requires --json flag")
+	if searchCompact && !searchJSON && !searchTOON {
+		return fmt.Errorf("--compact flag requires --json or --toon flag")
 	}
 
 	// Validate workspace-related flags
@@ -95,28 +147,37 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	var emb embedder.Embedder
 	switch cfg.Embedder.Provider {
 	case "ollama":
-		emb = embedder.NewOllamaEmbedder(
+		opts := []embedder.OllamaOption{
 			embedder.WithOllamaEndpoint(cfg.Embedder.Endpoint),
 			embedder.WithOllamaModel(cfg.Embedder.Model),
-			embedder.WithOllamaDimensions(cfg.Embedder.Dimensions),
-		)
+		}
+		if cfg.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithOllamaDimensions(*cfg.Embedder.Dimensions))
+		}
+		emb = embedder.NewOllamaEmbedder(opts...)
 	case "openai":
-		var err error
-		emb, err = embedder.NewOpenAIEmbedder(
+		opts := []embedder.OpenAIOption{
 			embedder.WithOpenAIModel(cfg.Embedder.Model),
 			embedder.WithOpenAIKey(cfg.Embedder.APIKey),
 			embedder.WithOpenAIEndpoint(cfg.Embedder.Endpoint),
-			embedder.WithOpenAIDimensions(cfg.Embedder.Dimensions),
-		)
+		}
+		if cfg.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithOpenAIDimensions(*cfg.Embedder.Dimensions))
+		}
+		var err error
+		emb, err = embedder.NewOpenAIEmbedder(opts...)
 		if err != nil {
 			return fmt.Errorf("failed to initialize OpenAI embedder: %w", err)
 		}
 	case "lmstudio":
-		emb = embedder.NewLMStudioEmbedder(
+		opts := []embedder.LMStudioOption{
 			embedder.WithLMStudioEndpoint(cfg.Embedder.Endpoint),
 			embedder.WithLMStudioModel(cfg.Embedder.Model),
-			embedder.WithLMStudioDimensions(cfg.Embedder.Dimensions),
-		)
+		}
+		if cfg.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithLMStudioDimensions(*cfg.Embedder.Dimensions))
+		}
+		emb = embedder.NewLMStudioEmbedder(opts...)
 	default:
 		return fmt.Errorf("unknown embedding provider: %s", cfg.Embedder.Provider)
 	}
@@ -134,7 +195,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		st = gobStore
 	case "postgres":
 		var err error
-		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.Dimensions)
+		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
 		if err != nil {
 			return fmt.Errorf("failed to connect to postgres: %w", err)
 		}
@@ -144,7 +205,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			collectionName = store.SanitizeCollectionName(projectRoot)
 		}
 		var err error
-		st, err = store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.Dimensions)
+		st, err = store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions())
 		if err != nil {
 			return fmt.Errorf("failed to connect to qdrant: %w", err)
 		}
@@ -160,17 +221,31 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	results, err := searcher.Search(ctx, query, searchLimit)
 	if err != nil {
 		if searchJSON {
-			return outputSearchError(err)
+			return outputSearchErrorJSON(err)
+		}
+		if searchTOON {
+			return outputSearchErrorTOON(err)
 		}
 		return fmt.Errorf("search failed: %w", err)
 	}
 
+	// Enrich results with RPG context
+	enrichments := enrichWithRPG(projectRoot, cfg, results)
+
 	// JSON output mode
 	if searchJSON {
 		if searchCompact {
-			return outputSearchCompactJSON(results)
+			return outputSearchCompactJSON(results, enrichments)
 		}
-		return outputSearchJSON(results)
+		return outputSearchJSON(results, enrichments)
+	}
+
+	// TOON output mode
+	if searchTOON {
+		if searchCompact {
+			return outputSearchCompactTOON(results, enrichments)
+		}
+		return outputSearchTOON(results, enrichments)
 	}
 
 	if len(results) == 0 {
@@ -209,15 +284,17 @@ func runSearch(cmd *cobra.Command, args []string) error {
 }
 
 // outputSearchJSON outputs results in JSON format for AI agents
-func outputSearchJSON(results []store.SearchResult) error {
+func outputSearchJSON(results []store.SearchResult, enrichments []rpgEnrichment) error {
 	jsonResults := make([]SearchResultJSON, len(results))
 	for i, r := range results {
 		jsonResults[i] = SearchResultJSON{
-			FilePath:  r.Chunk.FilePath,
-			StartLine: r.Chunk.StartLine,
-			EndLine:   r.Chunk.EndLine,
-			Score:     r.Score,
-			Content:   r.Chunk.Content,
+			FilePath:    r.Chunk.FilePath,
+			StartLine:   r.Chunk.StartLine,
+			EndLine:     r.Chunk.EndLine,
+			Score:       r.Score,
+			Content:     r.Chunk.Content,
+			FeaturePath: enrichments[i].FeaturePath,
+			SymbolName:  enrichments[i].SymbolName,
 		}
 	}
 
@@ -227,14 +304,16 @@ func outputSearchJSON(results []store.SearchResult) error {
 }
 
 // outputSearchCompactJSON outputs results in minimal JSON format (without content)
-func outputSearchCompactJSON(results []store.SearchResult) error {
+func outputSearchCompactJSON(results []store.SearchResult, enrichments []rpgEnrichment) error {
 	jsonResults := make([]SearchResultCompactJSON, len(results))
 	for i, r := range results {
 		jsonResults[i] = SearchResultCompactJSON{
-			FilePath:  r.Chunk.FilePath,
-			StartLine: r.Chunk.StartLine,
-			EndLine:   r.Chunk.EndLine,
-			Score:     r.Score,
+			FilePath:    r.Chunk.FilePath,
+			StartLine:   r.Chunk.StartLine,
+			EndLine:     r.Chunk.EndLine,
+			Score:       r.Score,
+			FeaturePath: enrichments[i].FeaturePath,
+			SymbolName:  enrichments[i].SymbolName,
 		}
 	}
 
@@ -243,11 +322,66 @@ func outputSearchCompactJSON(results []store.SearchResult) error {
 	return encoder.Encode(jsonResults)
 }
 
-// outputSearchError outputs an error in JSON format
-func outputSearchError(err error) error {
+// outputSearchErrorJSON outputs an error in JSON format
+func outputSearchErrorJSON(err error) error {
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(map[string]string{"error": err.Error()})
+	return nil
+}
+
+// outputSearchTOON outputs results in TOON format for AI agents
+func outputSearchTOON(results []store.SearchResult, enrichments []rpgEnrichment) error {
+	toonResults := make([]SearchResultJSON, len(results))
+	for i, r := range results {
+		toonResults[i] = SearchResultJSON{
+			FilePath:    r.Chunk.FilePath,
+			StartLine:   r.Chunk.StartLine,
+			EndLine:     r.Chunk.EndLine,
+			Score:       r.Score,
+			Content:     r.Chunk.Content,
+			FeaturePath: enrichments[i].FeaturePath,
+			SymbolName:  enrichments[i].SymbolName,
+		}
+	}
+
+	output, err := gotoon.Encode(toonResults)
+	if err != nil {
+		return fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	fmt.Println(output)
+	return nil
+}
+
+// outputSearchCompactTOON outputs results in minimal TOON format (without content)
+func outputSearchCompactTOON(results []store.SearchResult, enrichments []rpgEnrichment) error {
+	toonResults := make([]SearchResultCompactJSON, len(results))
+	for i, r := range results {
+		toonResults[i] = SearchResultCompactJSON{
+			FilePath:    r.Chunk.FilePath,
+			StartLine:   r.Chunk.StartLine,
+			EndLine:     r.Chunk.EndLine,
+			Score:       r.Score,
+			FeaturePath: enrichments[i].FeaturePath,
+			SymbolName:  enrichments[i].SymbolName,
+		}
+	}
+
+	output, err := gotoon.Encode(toonResults)
+	if err != nil {
+		return fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	fmt.Println(output)
+	return nil
+}
+
+// outputSearchErrorTOON outputs an error in TOON format
+func outputSearchErrorTOON(err error) error {
+	output, encErr := gotoon.Encode(map[string]string{"error": err.Error()})
+	if encErr != nil {
+		return fmt.Errorf("failed to encode TOON error: %w", encErr)
+	}
+	fmt.Println(output)
 	return nil
 }
 
@@ -295,7 +429,7 @@ func SearchJSON(projectRoot string, query string, limit int) ([]store.SearchResu
 		st = gobStore
 	case "postgres":
 		var err error
-		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.Dimensions)
+		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
 		if err != nil {
 			return nil, err
 		}
@@ -338,27 +472,36 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 	var emb embedder.Embedder
 	switch ws.Embedder.Provider {
 	case "ollama":
-		emb = embedder.NewOllamaEmbedder(
+		opts := []embedder.OllamaOption{
 			embedder.WithOllamaEndpoint(ws.Embedder.Endpoint),
 			embedder.WithOllamaModel(ws.Embedder.Model),
-			embedder.WithOllamaDimensions(ws.Embedder.Dimensions),
-		)
+		}
+		if ws.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithOllamaDimensions(*ws.Embedder.Dimensions))
+		}
+		emb = embedder.NewOllamaEmbedder(opts...)
 	case "openai":
-		emb, err = embedder.NewOpenAIEmbedder(
+		opts := []embedder.OpenAIOption{
 			embedder.WithOpenAIModel(ws.Embedder.Model),
 			embedder.WithOpenAIKey(ws.Embedder.APIKey),
 			embedder.WithOpenAIEndpoint(ws.Embedder.Endpoint),
-			embedder.WithOpenAIDimensions(ws.Embedder.Dimensions),
-		)
+		}
+		if ws.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithOpenAIDimensions(*ws.Embedder.Dimensions))
+		}
+		emb, err = embedder.NewOpenAIEmbedder(opts...)
 		if err != nil {
 			return fmt.Errorf("failed to initialize OpenAI embedder: %w", err)
 		}
 	case "lmstudio":
-		emb = embedder.NewLMStudioEmbedder(
+		opts := []embedder.LMStudioOption{
 			embedder.WithLMStudioEndpoint(ws.Embedder.Endpoint),
 			embedder.WithLMStudioModel(ws.Embedder.Model),
-			embedder.WithLMStudioDimensions(ws.Embedder.Dimensions),
-		)
+		}
+		if ws.Embedder.Dimensions != nil {
+			opts = append(opts, embedder.WithLMStudioDimensions(*ws.Embedder.Dimensions))
+		}
+		emb = embedder.NewLMStudioEmbedder(opts...)
 	default:
 		return fmt.Errorf("unknown embedding provider: %s", ws.Embedder.Provider)
 	}
@@ -370,7 +513,7 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 
 	switch ws.Store.Backend {
 	case "postgres":
-		st, err = store.NewPostgresStore(ctx, ws.Store.Postgres.DSN, projectID, ws.Embedder.Dimensions)
+		st, err = store.NewPostgresStore(ctx, ws.Store.Postgres.DSN, projectID, ws.Embedder.GetDimensions())
 		if err != nil {
 			return fmt.Errorf("failed to connect to postgres: %w", err)
 		}
@@ -379,7 +522,7 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 		if collectionName == "" {
 			collectionName = "workspace_" + ws.Name
 		}
-		st, err = store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.Dimensions)
+		st, err = store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions())
 		if err != nil {
 			return fmt.Errorf("failed to connect to qdrant: %w", err)
 		}
@@ -399,7 +542,10 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 	results, err := searcher.Search(ctx, query, searchLimit)
 	if err != nil {
 		if searchJSON {
-			return outputSearchError(err)
+			return outputSearchErrorJSON(err)
+		}
+		if searchTOON {
+			return outputSearchErrorTOON(err)
 		}
 		return fmt.Errorf("search failed: %w", err)
 	}
@@ -421,12 +567,23 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 		results = filteredResults
 	}
 
+	// Workspace mode doesn't have RPG enrichment (no single projectRoot)
+	enrichments := make([]rpgEnrichment, len(results))
+
 	// JSON output mode
 	if searchJSON {
 		if searchCompact {
-			return outputSearchCompactJSON(results)
+			return outputSearchCompactJSON(results, enrichments)
 		}
-		return outputSearchJSON(results)
+		return outputSearchJSON(results, enrichments)
+	}
+
+	// TOON output mode
+	if searchTOON {
+		if searchCompact {
+			return outputSearchCompactTOON(results, enrichments)
+		}
+		return outputSearchTOON(results, enrichments)
 	}
 
 	if len(results) == 0 {

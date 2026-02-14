@@ -4,11 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yoanbernabeu/grepai/daemon"
-	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/yoanbernabeu/grepai/watcher"
 )
 
 func skipIfWindows(t *testing.T) {
@@ -21,7 +23,7 @@ func TestShowWatchStatus_NotRunning(t *testing.T) {
 	logDir := t.TempDir()
 
 	// Status with no PID file
-	err := showWatchStatus(logDir)
+	err := showWatchStatus(logDir, "")
 	if err != nil {
 		t.Fatalf("showWatchStatus() failed: %v", err)
 	}
@@ -41,7 +43,7 @@ func TestShowWatchStatus_Running(t *testing.T) {
 	defer daemon.RemovePIDFile(logDir)
 
 	// Status with running process
-	err := showWatchStatus(logDir)
+	err := showWatchStatus(logDir, "")
 	if err != nil {
 		t.Fatalf("showWatchStatus() failed: %v", err)
 	}
@@ -57,7 +59,7 @@ func TestShowWatchStatus_StalePID(t *testing.T) {
 	}
 
 	// Status should clean stale PID
-	err := showWatchStatus(logDir)
+	err := showWatchStatus(logDir, "")
 	if err != nil {
 		t.Fatalf("showWatchStatus() failed: %v", err)
 	}
@@ -70,11 +72,35 @@ func TestShowWatchStatus_StalePID(t *testing.T) {
 	}
 }
 
+func TestShowWatchStatus_WorktreeNotRunning(t *testing.T) {
+	logDir := t.TempDir()
+	err := showWatchStatus(logDir, "wt-1")
+	if err != nil {
+		t.Fatalf("showWatchStatus() failed: %v", err)
+	}
+}
+
+func TestShowWatchStatus_WorktreeRunning(t *testing.T) {
+	logDir := t.TempDir()
+	worktreeID := "wt-2"
+
+	pidPath := daemon.GetWorktreePIDFile(logDir, worktreeID)
+	content := strconv.Itoa(os.Getpid()) + "\n"
+	if err := os.WriteFile(pidPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write worktree PID file: %v", err)
+	}
+
+	err := showWatchStatus(logDir, worktreeID)
+	if err != nil {
+		t.Fatalf("showWatchStatus() failed: %v", err)
+	}
+}
+
 func TestStopWatchDaemon_NotRunning(t *testing.T) {
 	logDir := t.TempDir()
 
 	// Stop with no PID file
-	err := stopWatchDaemon(logDir)
+	err := stopWatchDaemon(logDir, "")
 	if err != nil {
 		t.Fatalf("stopWatchDaemon() failed: %v", err)
 	}
@@ -90,7 +116,7 @@ func TestStopWatchDaemon_StalePID(t *testing.T) {
 	}
 
 	// Stop should clean stale PID
-	err := stopWatchDaemon(logDir)
+	err := stopWatchDaemon(logDir, "")
 	if err != nil {
 		t.Fatalf("stopWatchDaemon() failed: %v", err)
 	}
@@ -100,6 +126,14 @@ func TestStopWatchDaemon_StalePID(t *testing.T) {
 		if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 			t.Error("Stale PID file was not removed")
 		}
+	}
+}
+
+func TestStopWatchDaemon_WorktreeNotRunning(t *testing.T) {
+	logDir := t.TempDir()
+	err := stopWatchDaemon(logDir, "wt-3")
+	if err != nil {
+		t.Fatalf("stopWatchDaemon() failed: %v", err)
 	}
 }
 
@@ -114,7 +148,7 @@ func TestStartBackgroundWatch_AlreadyRunning(t *testing.T) {
 	defer daemon.RemovePIDFile(logDir)
 
 	// Try to start background watch (should fail)
-	err := startBackgroundWatch(logDir)
+	err := startBackgroundWatch(logDir, "")
 	if err == nil {
 		t.Fatal("startBackgroundWatch() should have failed when already running")
 	}
@@ -144,6 +178,29 @@ func TestStartBackgroundWatch_CleansStalePID(t *testing.T) {
 	// The actual startBackgroundWatch would spawn a process here,
 	// which we can't easily test in a unit test.
 	// This is better tested in integration tests.
+}
+
+func TestStartBackgroundWatch_WorktreeAlreadyRunning(t *testing.T) {
+	logDir := t.TempDir()
+	worktreeID := "wt-4"
+
+	pidPath := daemon.GetWorktreePIDFile(logDir, worktreeID)
+	content := strconv.Itoa(os.Getpid()) + "\n"
+	if err := os.WriteFile(pidPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write worktree PID file: %v", err)
+	}
+
+	originalWatchLogDir := watchLogDir
+	watchLogDir = ""
+	defer func() { watchLogDir = originalWatchLogDir }()
+
+	err := startBackgroundWatch(logDir, worktreeID)
+	if err == nil {
+		t.Fatal("startBackgroundWatch() should have failed when worktree watcher already running")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("startBackgroundWatch() error = %q, want message containing %q", err.Error(), "already running")
+	}
 }
 
 func TestRunWatch_CheckAlreadyRunning(t *testing.T) {
@@ -271,7 +328,7 @@ func TestStopWatchDaemon_WaitForShutdown(t *testing.T) {
 
 	// Measure time taken
 	start := time.Now()
-	err := stopWatchDaemon(logDir)
+	err := stopWatchDaemon(logDir, "")
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -291,155 +348,75 @@ func TestStopWatchDaemon_WaitForShutdown(t *testing.T) {
 	}
 }
 
-func TestIsTracedLanguage(t *testing.T) {
-	tests := []struct {
-		name             string
-		ext              string
-		enabledLanguages []string
-		expected         bool
-	}{
-		{
-			name:             "go file in list",
-			ext:              ".go",
-			enabledLanguages: []string{".go", ".js", ".ts"},
-			expected:         true,
-		},
-		{
-			name:             "py file not in list",
-			ext:              ".py",
-			enabledLanguages: []string{".go", ".js", ".ts"},
-			expected:         false,
-		},
-		{
-			name:             "exact match required",
-			ext:              ".tsx",
-			enabledLanguages: []string{".ts"},
-			expected:         false,
-		},
-		{
-			name:             "empty list",
-			ext:              ".go",
-			enabledLanguages: []string{},
-			expected:         false,
-		},
-		{
-			name:             "single element list match",
-			ext:              ".py",
-			enabledLanguages: []string{".py"},
-			expected:         true,
-		},
-	}
+func TestIsTracedLanguage_should_match_known_extensions(t *testing.T) {
+	langs := []string{".go", ".js", ".ts", ".py"}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isTracedLanguage(tt.ext, tt.enabledLanguages)
-			if result != tt.expected {
-				t.Errorf("isTracedLanguage(%q, %v) = %v, want %v", tt.ext, tt.enabledLanguages, result, tt.expected)
-			}
-		})
+	if !isTracedLanguage(".go", langs) {
+		t.Error("expected .go to be traced")
+	}
+	if !isTracedLanguage(".py", langs) {
+		t.Error("expected .py to be traced")
+	}
+	if isTracedLanguage(".rs", langs) {
+		t.Error("expected .rs to NOT be traced")
+	}
+	if isTracedLanguage("", langs) {
+		t.Error("expected empty string to NOT be traced")
 	}
 }
 
-func TestDescribeRetryReason(t *testing.T) {
-	tests := []struct {
-		name       string
-		statusCode int
-		expected   string
-	}{
-		{
-			name:       "rate limited 429",
-			statusCode: 429,
-			expected:   "Rate limited (429)",
-		},
-		{
-			name:       "server error 500",
-			statusCode: 500,
-			expected:   "Server error (500)",
-		},
-		{
-			name:       "server error 503",
-			statusCode: 503,
-			expected:   "Server error (503)",
-		},
-		{
-			name:       "server error 599",
-			statusCode: 599,
-			expected:   "Server error (599)",
-		},
-		{
-			name:       "other HTTP error 400",
-			statusCode: 400,
-			expected:   "HTTP error (400)",
-		},
-		{
-			name:       "zero status code",
-			statusCode: 0,
-			expected:   "Error",
-		},
-		{
-			name:       "negative status code",
-			statusCode: -1,
-			expected:   "Error",
-		},
+func TestIsTracedLanguage_should_return_false_for_empty_list(t *testing.T) {
+	if isTracedLanguage(".go", nil) {
+		t.Error("expected false for nil languages list")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := describeRetryReason(tt.statusCode)
-			if result != tt.expected {
-				t.Errorf("describeRetryReason(%d) = %q, want %q", tt.statusCode, result, tt.expected)
-			}
-		})
+	if isTracedLanguage(".go", []string{}) {
+		t.Error("expected false for empty languages list")
 	}
 }
 
-func TestPrintProgress(t *testing.T) {
-	// Test with total=0 (edge case - should return early)
-	printProgress(1, 0, "test.go")
-
-	// Test normal case
-	printProgress(5, 10, "short.go")
-
-	// Test with long file path (should be truncated)
-	longPath := "/very/long/path/to/some/deeply/nested/file/that/exceeds/the/maximum/length.go"
-	printProgress(1, 10, longPath)
-
-	// Test at 100%
-	printProgress(10, 10, "done.go")
+func TestStopWorkspaceWatchDaemon_should_handle_not_running(t *testing.T) {
+	logDir := t.TempDir()
+	err := stopWorkspaceWatchDaemon(logDir, "test-ws")
+	if err != nil {
+		t.Fatalf("stopWorkspaceWatchDaemon() failed: %v", err)
+	}
 }
 
-func TestPrintBatchProgress(t *testing.T) {
-	// Test retrying case
-	info := indexer.BatchProgressInfo{
-		BatchIndex: 0,
-		Retrying:   true,
-		StatusCode: 429,
-		Attempt:    2,
+func TestStopWorkspaceWatchDaemon_should_handle_stale_pid(t *testing.T) {
+	logDir := t.TempDir()
+	pidPath := daemon.GetWorkspacePIDFile(logDir, "test-ws")
+	if err := os.WriteFile(pidPath, []byte("9999997\n"), 0644); err != nil {
+		t.Fatalf("failed to write PID file: %v", err)
 	}
-	printBatchProgress(info)
 
-	// Test retrying with server error
-	info2 := indexer.BatchProgressInfo{
-		BatchIndex: 1,
-		Retrying:   true,
-		StatusCode: 500,
-		Attempt:    3,
-	}
-	printBatchProgress(info2)
+	start := time.Now()
+	err := stopWorkspaceWatchDaemon(logDir, "test-ws")
+	elapsed := time.Since(start)
 
-	// Test normal progress
-	info3 := indexer.BatchProgressInfo{
-		CompletedChunks: 50,
-		TotalChunks:     100,
-		Retrying:        false,
+	if err != nil {
+		t.Fatalf("stopWorkspaceWatchDaemon() failed: %v", err)
 	}
-	printBatchProgress(info3)
+	if elapsed > 5*time.Second {
+		t.Errorf("stopWorkspaceWatchDaemon() took too long: %v", elapsed)
+	}
+}
 
-	// Test with zero total chunks (edge case)
-	info4 := indexer.BatchProgressInfo{
-		CompletedChunks: 0,
-		TotalChunks:     0,
-		Retrying:        false,
+func TestWorkspaceWatchEvent_should_carry_project_path(t *testing.T) {
+	evt := workspaceWatchEvent{
+		projectPath: "/home/user/projects/myapp",
+		event: watcher.FileEvent{
+			Type: watcher.EventCreate,
+			Path: "src/main.go",
+		},
 	}
-	printBatchProgress(info4)
+
+	if evt.event.Type != watcher.EventCreate {
+		t.Errorf("event type = %v, want EventCreate", evt.event.Type)
+	}
+	if evt.event.Path != "src/main.go" {
+		t.Errorf("event path = %q, want %q", evt.event.Path, "src/main.go")
+	}
+	if evt.projectPath != "/home/user/projects/myapp" {
+		t.Errorf("project path = %q, want %q", evt.projectPath, "/home/user/projects/myapp")
+	}
 }

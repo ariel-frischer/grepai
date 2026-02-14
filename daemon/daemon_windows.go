@@ -6,7 +6,10 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -76,4 +79,109 @@ func lockFile(f *os.File) error {
 // On Windows, returns nil as no special process attributes are needed for background spawning.
 func sysProcAttr() *syscall.SysProcAttr {
 	return nil
+}
+
+// livenessCheck uses polling on Windows since ExtraFiles is not supported.
+// Windows doesn't have zombie processes, so IsProcessRunning is reliable.
+type livenessCheck struct{}
+
+func newLivenessCheck() (*livenessCheck, error) {
+	return &livenessCheck{}, nil
+}
+
+func (l *livenessCheck) configureCmd(cmd *exec.Cmd) {
+	// no-op: ExtraFiles not supported on Windows
+}
+
+// start polls IsProcessRunning to detect child exit.
+// Returns a channel that is closed when the child exits.
+func (l *livenessCheck) start(pid int) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		for {
+			time.Sleep(250 * time.Millisecond)
+			if !IsProcessRunning(pid) {
+				close(ch)
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+func (l *livenessCheck) cleanup() {
+	// no-op
+}
+
+const (
+	stopFilePrefix    = "grepai-stop-"
+	stopPollInterval  = 500 * time.Millisecond
+	stopStaleAfter    = 60 * time.Second
+)
+
+// stopFilePath returns the path to the sentinel stop file for the given PID.
+func stopFilePath(pid int) (string, error) {
+	logDir, err := GetDefaultLogDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(logDir, fmt.Sprintf("%s%d", stopFilePrefix, pid)), nil
+}
+
+// StopProcess writes a sentinel stop file that the daemon polls for.
+// This avoids os.Interrupt which is not supported cross-console on Windows.
+func StopProcess(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid PID: %d", pid)
+	}
+
+	if !IsProcessRunning(pid) {
+		return fmt.Errorf("process %d is not running", pid)
+	}
+
+	path, err := stopFilePath(pid)
+	if err != nil {
+		return fmt.Errorf("failed to determine stop file path: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", pid)), 0600); err != nil {
+		return fmt.Errorf("failed to write stop file: %w", err)
+	}
+
+	return nil
+}
+
+// StopChannel returns a channel that is closed when a stop file is detected
+// for the current process. It also cleans up any stale stop files from
+// previous runs on startup.
+func StopChannel() <-chan struct{} {
+	ch := make(chan struct{})
+	pid := os.Getpid()
+
+	path, err := stopFilePath(pid)
+	if err != nil {
+		// Can't determine path; return inert channel.
+		return ch
+	}
+
+	// Clean up stale stop file from a previous run that reused this PID.
+	_ = os.Remove(path)
+
+	go func() {
+		for {
+			time.Sleep(stopPollInterval)
+			if _, err := os.Stat(path); err == nil {
+				// Stop file detected — remove it and signal shutdown.
+				_ = os.Remove(path)
+				close(ch)
+				return
+			}
+		}
+	}()
+
+	return ch
 }

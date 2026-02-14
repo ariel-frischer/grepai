@@ -5,7 +5,9 @@ package daemon
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"syscall"
 )
 
@@ -44,4 +46,71 @@ func sysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+}
+
+// livenessCheck uses a pipe to detect child process exit.
+// The write end is inherited by the child; when it exits the kernel closes
+// all its FDs, giving EOF on the parent's read end. This reliably detects
+// exit regardless of zombie state or process group settings.
+type livenessCheck struct {
+	pr, pw *os.File
+}
+
+func newLivenessCheck() (*livenessCheck, error) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create liveness pipe: %w", err)
+	}
+	return &livenessCheck{pr: pr, pw: pw}, nil
+}
+
+func (l *livenessCheck) configureCmd(cmd *exec.Cmd) {
+	cmd.ExtraFiles = []*os.File{l.pw}
+}
+
+// start closes the write end in the parent and begins monitoring.
+// Returns a channel that is closed when the child exits.
+func (l *livenessCheck) start(_ int) <-chan struct{} {
+	l.pw.Close()
+	ch := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		if _, err := l.pr.Read(buf); err != nil && err != io.EOF {
+			// Ignore read errors: liveness only needs unblocking on exit/close.
+			_ = err
+		}
+		l.pr.Close()
+		close(ch)
+	}()
+	return ch
+}
+
+func (l *livenessCheck) cleanup() {
+	l.pr.Close()
+	l.pw.Close()
+}
+
+// StopProcess sends SIGINT to the process with the given PID.
+func StopProcess(pid int) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid PID: %d", pid)
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process: %w", err)
+	}
+
+	if err := process.Signal(os.Interrupt); err != nil {
+		return fmt.Errorf("failed to send interrupt signal: %w", err)
+	}
+
+	return nil
+}
+
+// StopChannel returns a channel that never fires on Unix.
+// Signal-based shutdown is handled via os/signal, so no additional
+// mechanism is needed.
+func StopChannel() <-chan struct{} {
+	return make(chan struct{})
 }

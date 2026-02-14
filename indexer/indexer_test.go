@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -989,48 +988,82 @@ func TestWrapBatchProgress(t *testing.T) {
 	})
 }
 
-// mockBatchEmbedderWithError implements embedder.BatchEmbedder that returns an error
-type mockBatchEmbedderWithError struct {
-	embedCalled bool
+// mockContextLimitEmbedder simulates an embedder that fails on large chunks
+type mockContextLimitEmbedder struct {
+	maxChars        int  // Max characters allowed per chunk
+	failOnce        bool // If true, fails only on first attempt
+	failedOnce      bool // Track if we've already failed
+	embedCallCount  int
+	rechunkExpected bool
 }
 
-func (m *mockBatchEmbedderWithError) Embed(ctx context.Context, text string) ([]float32, error) {
-	m.embedCalled = true
-	return nil, fmt.Errorf("embedding error")
+func newMockContextLimitEmbedder(maxChars int) *mockContextLimitEmbedder {
+	return &mockContextLimitEmbedder{
+		maxChars: maxChars,
+	}
 }
 
-func (m *mockBatchEmbedderWithError) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	m.embedCalled = true
-	return nil, fmt.Errorf("batch embedding error")
+func (m *mockContextLimitEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	m.embedCallCount++
+	if len(text) > m.maxChars {
+		if m.failOnce && m.failedOnce {
+			// Second attempt should succeed after re-chunking
+			return []float32{0.1, 0.2, 0.3}, nil
+		}
+		m.failedOnce = true
+		return nil, embedder.NewContextLengthError(0, len(text)/4, m.maxChars/4, "input exceeds context length")
+	}
+	return []float32{0.1, 0.2, 0.3}, nil
 }
 
-func (m *mockBatchEmbedderWithError) Dimensions() int {
+func (m *mockContextLimitEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	m.embedCallCount++
+	vectors := make([][]float32, len(texts))
+
+	for i, text := range texts {
+		if len(text) > m.maxChars {
+			if m.failOnce && m.failedOnce {
+				// After re-chunking, smaller chunks should succeed
+				vectors[i] = []float32{0.1, 0.2, 0.3}
+				continue
+			}
+			m.failedOnce = true
+			m.rechunkExpected = true
+			return nil, embedder.NewContextLengthError(i, len(text)/4, m.maxChars/4, "input exceeds context length")
+		}
+		vectors[i] = []float32{0.1, 0.2, 0.3}
+	}
+
+	return vectors, nil
+}
+
+func (m *mockContextLimitEmbedder) Dimensions() int {
 	return 3
 }
 
-func (m *mockBatchEmbedderWithError) Close() error {
+func (m *mockContextLimitEmbedder) Close() error {
 	return nil
 }
 
-func (m *mockBatchEmbedderWithError) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
-	m.embedCalled = true
-	return nil, fmt.Errorf("batch embedder error")
-}
-
-// TestIndexFilesBatched_EmbedderError tests that embedder errors are propagated correctly
-func TestIndexFilesBatched_EmbedderError(t *testing.T) {
+// TestIndexFile_ReChunkOnContextLengthError tests that files with large chunks are re-chunked
+func TestIndexFile_ReChunkOnContextLengthError(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create test file
-	testFile := filepath.Join(tmpDir, "test.go")
-	content := "package main\n\nfunc main() { /* some content */ }"
-	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+	// Create a file with content that will exceed the mock embedder's limit
+	// With chunk size 512 and 4 chars per token, max chars = 2048
+	// We'll create a file larger than this
+	testFile := filepath.Join(tmpDir, "large.go")
+	largeContent := "package main\n\n" + strings.Repeat("// This is a very long comment line that repeats many times\n", 200)
+	err := os.WriteFile(testFile, []byte(largeContent), 0644)
+	if err != nil {
 		t.Fatalf("failed to create test file: %v", err)
 	}
 
-	mockStore := newMockStore()
-	mockEmb := &mockBatchEmbedderWithError{}
+	// Create mock embedder with small limit (1000 chars)
+	mockEmb := newMockContextLimitEmbedder(1000)
+	mockEmb.failOnce = true // Allow success after re-chunking
 
+	mockStore := newMockStore()
 	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
 	if err != nil {
 		t.Fatalf("failed to create ignore matcher: %v", err)
@@ -1039,46 +1072,93 @@ func TestIndexFilesBatched_EmbedderError(t *testing.T) {
 	chunker := NewChunker(512, 50)
 	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
 
-	// Index should fail due to embedder error
-	_, err = indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
-	if err == nil {
-		t.Fatal("expected error from embedder, got nil")
-	}
-
-	// Verify error message contains our error
-	if !strings.Contains(err.Error(), "batch embedder error") {
-		t.Errorf("expected error to contain 'batch embedder error', got: %v", err)
-	}
-}
-
-// TestIndexAllWithBatchProgress_NilBatchProgress tests that nil batch progress callback works
-func TestIndexAllWithBatchProgress_NilBatchProgress(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	testFile := filepath.Join(tmpDir, "test.go")
-	content := "package main\n\nfunc main() {}"
-	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to create test file: %v", err)
-	}
-
-	mockStore := newMockStore()
-	mockEmb := newMockBatchEmbedder()
-
-	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	// Index the file
+	stats, err := indexer.IndexAllWithProgress(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("failed to create ignore matcher: %v", err)
-	}
-	scanner := NewScanner(tmpDir, ignoreMatcher)
-	chunker := NewChunker(512, 50)
-	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
-
-	// Should not panic with nil progress callbacks
-	stats, err := indexer.IndexAllWithBatchProgress(context.Background(), nil, nil)
-	if err != nil {
-		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
+		t.Fatalf("IndexAllWithProgress failed: %v", err)
 	}
 
+	// Should have indexed the file (possibly with re-chunking)
 	if stats.FilesIndexed != 1 {
 		t.Errorf("expected 1 file indexed, got %d", stats.FilesIndexed)
+	}
+
+	// Chunks should have been created
+	if stats.ChunksCreated == 0 {
+		t.Error("expected chunks to be created")
+	}
+
+	// Embedder should have been called multiple times (original + retry after re-chunk)
+	if mockEmb.embedCallCount < 2 {
+		t.Errorf("expected at least 2 embed calls (original + after re-chunk), got %d", mockEmb.embedCallCount)
+	}
+}
+
+// TestEmbedWithReChunking_Success tests successful embedding without re-chunking
+func TestEmbedWithReChunking_Success(t *testing.T) {
+	mockEmb := newMockEmbedder()
+	mockStore := newMockStore()
+	chunker := NewChunker(512, 50)
+
+	indexer := &Indexer{
+		root:     "/test",
+		store:    mockStore,
+		embedder: mockEmb,
+		chunker:  chunker,
+	}
+
+	chunks := []ChunkInfo{
+		{ID: "chunk1", FilePath: "test.go", Content: "small content", StartLine: 1, EndLine: 5},
+		{ID: "chunk2", FilePath: "test.go", Content: "more content", StartLine: 6, EndLine: 10},
+	}
+
+	vectors, finalChunks, err := indexer.embedWithReChunking(context.Background(), chunks)
+	if err != nil {
+		t.Fatalf("embedWithReChunking failed: %v", err)
+	}
+
+	if len(vectors) != 2 {
+		t.Errorf("expected 2 vectors, got %d", len(vectors))
+	}
+	if len(finalChunks) != 2 {
+		t.Errorf("expected 2 final chunks, got %d", len(finalChunks))
+	}
+}
+
+// TestEmbedWithReChunking_ReChunksOnError tests re-chunking when context limit is exceeded
+func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
+	// Create embedder that fails on content > 500 chars
+	mockEmb := newMockContextLimitEmbedder(500)
+	mockEmb.failOnce = true
+
+	mockStore := newMockStore()
+	chunker := NewChunker(256, 25)
+
+	indexer := &Indexer{
+		root:     "/test",
+		store:    mockStore,
+		embedder: mockEmb,
+		chunker:  chunker,
+	}
+
+	// Create one large chunk that will exceed the limit
+	largeContent := strings.Repeat("x", 1000)
+	chunks := []ChunkInfo{
+		{ID: "test.go_0", FilePath: "test.go", Content: largeContent, StartLine: 1, EndLine: 50},
+	}
+
+	vectors, finalChunks, err := indexer.embedWithReChunking(context.Background(), chunks)
+	if err != nil {
+		t.Fatalf("embedWithReChunking failed: %v", err)
+	}
+
+	// Should have more chunks after re-chunking
+	if len(finalChunks) <= 1 {
+		t.Errorf("expected more than 1 chunk after re-chunking, got %d", len(finalChunks))
+	}
+
+	// Should have same number of vectors as chunks
+	if len(vectors) != len(finalChunks) {
+		t.Errorf("vectors count %d != chunks count %d", len(vectors), len(finalChunks))
 	}
 }

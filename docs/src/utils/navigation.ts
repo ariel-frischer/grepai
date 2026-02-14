@@ -26,9 +26,11 @@ export const navigation: NavSection[] = [
       { label: 'Call Graph Analysis', href: '/grepai/trace/', order: 3 },
       { label: 'MCP Integration', href: '/grepai/mcp/', order: 4 },
       { label: 'Claude Code Subagent', href: '/grepai/subagent/', order: 5 },
-      { label: 'Search Boost', href: '/grepai/search-boost/', order: 6 },
-      { label: 'Hybrid Search', href: '/grepai/hybrid-search/', order: 7 },
-      { label: 'Workspace Management', href: '/grepai/workspace/', order: 8 },
+      { label: 'AI Agent Skills', href: '/grepai/skills/', order: 6 },
+      { label: 'Search Boost', href: '/grepai/search-boost/', order: 7 },
+      { label: 'Hybrid Search', href: '/grepai/hybrid-search/', order: 8 },
+      { label: 'Git Worktrees', href: '/grepai/git-worktrees/', order: 9 },
+      { label: 'Workspace Management', href: '/grepai/workspace/', order: 10 },
     ],
   },
   {
@@ -71,9 +73,10 @@ export const navigation: NavSection[] = [
     ],
   },
   {
-    title: 'Contributing',
+    title: 'Community',
     items: [
-      { label: 'How to Contribute', href: '/grepai/contributing/', order: 1 },
+      { label: 'Community Tools', href: '/grepai/community-tools/', order: 1 },
+      { label: 'How to Contribute', href: '/grepai/contributing/', order: 2 },
     ],
   },
 ];

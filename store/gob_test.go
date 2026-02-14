@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -154,6 +155,20 @@ func TestGOBStore_PersistAndLoad(t *testing.T) {
 
 	if results[0].Chunk.Content != "test content" {
 		t.Errorf("expected content 'test content', got '%s'", results[0].Chunk.Content)
+	}
+}
+
+func TestGOBStore_PersistCreatesMissingParentDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "missing", ".grepai", "index.gob")
+
+	s := NewGOBStore(indexPath)
+	if err := s.Persist(context.Background()); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("expected persisted index file at %s: %v", indexPath, err)
 	}
 }
 
@@ -352,5 +367,80 @@ func TestGOBStore_GetChunksForFile(t *testing.T) {
 	}
 	if result != nil {
 		t.Error("expected nil for non-existent file")
+	}
+}
+
+func TestGOBStore_LookupByContentHash(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	store := NewGOBStore(indexPath)
+	ctx := context.Background()
+
+	// Add chunks with content hashes
+	store.SaveChunks(ctx, []Chunk{
+		{
+			ID:          "chunk-1",
+			FilePath:    "main.go",
+			Content:     "func main() {}",
+			Vector:      []float32{0.1, 0.2, 0.3},
+			ContentHash: "abc123",
+		},
+	})
+
+	// Lookup existing hash
+	vec, found, err := store.LookupByContentHash(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("LookupByContentHash failed: %v", err)
+	}
+	if !found {
+		t.Fatal("Expected to find chunk by content hash")
+	}
+	if len(vec) != 3 || vec[0] != 0.1 {
+		t.Errorf("Unexpected vector: %v", vec)
+	}
+
+	// Lookup non-existent hash
+	_, found, err = store.LookupByContentHash(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("LookupByContentHash failed: %v", err)
+	}
+	if found {
+		t.Fatal("Expected not found for non-existent hash")
+	}
+}
+
+func TestGOBStore_FileLocking(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+
+	// Create and populate a store
+	s1 := NewGOBStore(indexPath)
+	s1.SaveChunks(ctx, []Chunk{
+		{ID: "c1", FilePath: "a.go", Content: "hello", Vector: []float32{1, 2, 3}},
+	})
+	if err := s1.Persist(ctx); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	// Verify lock file was created
+	lockPath := indexPath + ".lock"
+	if _, err := os.Stat(lockPath); os.IsNotExist(err) {
+		t.Fatal("Expected lock file to be created")
+	}
+
+	// Load from another store instance (simulates concurrent access)
+	s2 := NewGOBStore(indexPath)
+	if err := s2.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	chunks, err := s2.GetAllChunks(ctx)
+	if err != nil {
+		t.Fatalf("GetAllChunks failed: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("Expected 1 chunk, got %d", len(chunks))
+	}
+	if chunks[0].ID != "c1" {
+		t.Errorf("Expected chunk ID c1, got %s", chunks[0].ID)
 	}
 }

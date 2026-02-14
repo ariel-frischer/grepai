@@ -8,15 +8,16 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/git"
 	"github.com/yoanbernabeu/grepai/indexer"
 )
 
 var (
-	initProvider       string
-	initModel          string
-	initBackend        string
-	initNonInteractive bool
-	// Backend-specific flags
+	initProvider         string
+	initModel            string
+	initBackend          string
+	initNonInteractive   bool
+	initInherit          bool
 	initPostgresDSN      string
 	initQdrantEndpoint   string
 	initQdrantPort       int
@@ -26,7 +27,6 @@ var (
 )
 
 const (
-	openAI3SmallDimensions      = 1536
 	lmStudioEmbeddingDimensions = 768
 )
 
@@ -37,12 +37,13 @@ func applyProviderConfig(cfg *config.Config, provider string) {
 	case "lmstudio":
 		cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
 		cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
-		cfg.Embedder.Dimensions = lmStudioEmbeddingDimensions
+		dim := lmStudioEmbeddingDimensions
+		cfg.Embedder.Dimensions = &dim
 	case "openai":
 		cfg.Embedder.Model = "text-embedding-3-small"
 		cfg.Embedder.Endpoint = "https://api.openai.com/v1"
-		cfg.Embedder.Dimensions = openAI3SmallDimensions
-	// ollama uses defaults from config.DefaultConfig()
+		// OpenAI: leave Dimensions nil to use model's native dimensions
+		// ollama uses defaults from config.DefaultConfig()
 	}
 }
 
@@ -81,6 +82,7 @@ func init() {
 	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (overrides provider default)")
 	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
 	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
+	initCmd.Flags().BoolVar(&initInherit, "inherit", false, "Inherit configuration from main worktree (for git worktrees)")
 
 	// Backend-specific flags
 	initCmd.Flags().StringVar(&initPostgresDSN, "postgres-dsn", "", "PostgreSQL connection string (required for postgres backend)")
@@ -105,9 +107,45 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := config.DefaultConfig()
+	skipPrompts := false
+
+	// Detect git worktree and offer config inheritance
+	gitInfo, gitErr := git.Detect(cwd)
+	if gitErr == nil && gitInfo.IsWorktree && config.Exists(gitInfo.MainWorktree) {
+		mainCfg, loadErr := config.Load(gitInfo.MainWorktree)
+		if loadErr == nil {
+			fmt.Printf("\nGit worktree detected.\n")
+			fmt.Printf("  Main worktree: %s\n", gitInfo.MainWorktree)
+			fmt.Printf("  Worktree ID:   %s\n", gitInfo.WorktreeID)
+			fmt.Printf("  Backend:       %s\n", mainCfg.Store.Backend)
+
+			shouldInherit := initInherit
+			if !shouldInherit && !initNonInteractive {
+				reader := bufio.NewReader(os.Stdin)
+				fmt.Print("\nInherit configuration from main worktree? [Y/n]: ")
+				input, _ := reader.ReadString('\n')
+				input = strings.TrimSpace(strings.ToLower(input))
+				shouldInherit = input == "" || input == "y" || input == "yes"
+			}
+
+			if shouldInherit {
+				cfg = mainCfg
+				skipPrompts = true
+
+				if cfg.Store.Backend == "gob" {
+					fmt.Println("\nNote: GOB backend creates an independent index per worktree.")
+					fmt.Println("For shared indexing across worktrees, consider using 'postgres' or 'qdrant' backend.")
+				} else {
+					fmt.Printf("\nUsing %s backend - each worktree maintains its own project scope within the shared store.\n", cfg.Store.Backend)
+				}
+			}
+		} else {
+			fmt.Printf("Warning: could not load main worktree config: %v\n", loadErr)
+		}
+	}
 
 	// Interactive mode
-	if !initNonInteractive {
+	if !skipPrompts && !initNonInteractive {
 		reader := bufio.NewReader(os.Stdin)
 
 		// Provider selection
@@ -123,18 +161,45 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 			switch input {
 			case "2", "lmstudio":
-				applyProviderConfig(cfg, "lmstudio")
+				cfg.Embedder.Provider = "lmstudio"
+				fmt.Print("LM Studio endpoint [http://127.0.0.1:1234]: ")
+				endpoint, _ := reader.ReadString('\n')
+				endpoint = strings.TrimSpace(endpoint)
+				if endpoint == "" {
+					endpoint = "http://127.0.0.1:1234"
+				}
+				cfg.Embedder.Endpoint = endpoint
+				cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
+				dim := lmStudioEmbeddingDimensions
+				cfg.Embedder.Dimensions = &dim
 			case "3", "openai":
-				applyProviderConfig(cfg, "openai")
+				cfg.Embedder.Provider = "openai"
+				cfg.Embedder.Model = "text-embedding-3-small"
+				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				// OpenAI: leave Dimensions nil to use model's native dimensions
 			default:
-				applyProviderConfig(cfg, "ollama")
+				cfg.Embedder.Provider = "ollama"
+				fmt.Print("Ollama endpoint [http://localhost:11434]: ")
+				endpoint, _ := reader.ReadString('\n')
+				endpoint = strings.TrimSpace(endpoint)
+				if endpoint == "" {
+					endpoint = "http://localhost:11434"
+				}
+				cfg.Embedder.Endpoint = endpoint
 			}
 		} else {
-			applyProviderConfig(cfg, initProvider)
-		}
-		// Apply model override if specified
-		if initModel != "" {
-			cfg.Embedder.Model = initModel
+			cfg.Embedder.Provider = initProvider
+			switch initProvider {
+			case "lmstudio":
+				cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
+				cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
+				dim := lmStudioEmbeddingDimensions
+				cfg.Embedder.Dimensions = &dim
+			case "openai":
+				cfg.Embedder.Model = "text-embedding-3-small"
+				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				// OpenAI: leave Dimensions nil to use model's native dimensions
+			}
 		}
 
 		// Backend selection
@@ -196,8 +261,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		} else {
 			cfg.Store.Backend = initBackend
 		}
-	} else {
-		// Non-interactive mode
+	} else if !skipPrompts {
+		// Non-interactive with flags
 		if initProvider != "" {
 			applyProviderConfig(cfg, initProvider)
 		}

@@ -14,46 +14,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `-m, --model`: Override embedding model (e.g., `--model text-embedding-3-large`)
   - `--postgres-dsn`: PostgreSQL DSN (required for postgres backend in non-interactive mode)
   - `--qdrant-endpoint`, `--qdrant-port`, `--qdrant-tls`, `--qdrant-api-key`, `--qdrant-collection`: Qdrant configuration
-  - Examples:
-    - `grepai init --yes` (defaults)
-    - `grepai init --yes --provider openai --model text-embedding-3-large`
-    - `grepai init --yes --backend postgres --postgres-dsn "postgres://..."`
 
 - **Agentic CLI Support**: Non-interactive CLI commands for AI agents and scripts
   - New `grepai index` command: One-shot indexing that completes and exits (unlike `watch`)
-    - `grepai index`: Index codebase and print human-readable summary
-    - `grepai index --json`: Output JSON result with `files_indexed`, `chunks_created`, `files_removed`, `files_skipped`, `symbols_extracted`, `duration_ms`
-    - Deterministic, finite operation suitable for CI/CD and AI agent workflows
-    - Exit code 0 on success, non-zero with JSON error on failure
-  - Enhanced `grepai status` command with non-TTY output modes
-    - `grepai status --plain`: Human-readable text output (key: value format)
-    - `grepai status --json`: JSON output with `files_indexed`, `total_chunks`, `index_size_bytes`, `last_updated`, `provider`, `model`
-    - Interactive TUI remains the default when TTY is available
-    - Clear error message when running without TTY and without output flags
-    - Flags are mutually exclusive (`--plain` and `--json` cannot be combined)
+  - Enhanced `grepai status` command with `--plain` and `--json` output modes
 
-- **Adaptive Rate Limiting for OpenAI**: Intelligent rate limit handling that automatically optimizes parallelism
-  - **Automatic parallelism adjustment**: Halves parallelism after consecutive 429 responses, gradually restores after successful requests
-  - **Retry-After header support**: Uses OpenAI's Retry-After header for optimal retry timing when present
-  - **Proactive token pacing**: Optional TPM limit (`WithOpenAITPMLimit`) to pace requests and avoid hitting rate limits
-  - **Enhanced visibility**: Logs parallelism adjustments with old/new values for debugging and monitoring
-  - Addresses the 16% performance regression observed with parallelism=4 under rate limiting conditions
-  - New `embedder/rate_limiter.go` with thread-safe `AdaptiveRateLimiter` and `TokenBucket` implementations
-  - All rate limiting code passes race detector tests
+## [0.31.0] - 2026-02-13
 
-- **Parallel OpenAI Embedding**: Cross-file batch embedding with parallel API requests for 3x+ faster indexing
-  - Batches chunks from multiple files into single API requests (up to 2000 inputs per batch)
-  - Parallel batch processing with configurable worker count (default: 4 workers)
-  - New `embedder.parallelism` configuration option to tune concurrency for your API tier
-  - Automatic retry with exponential backoff (1s base, 2x multiplier, max 32s) on rate limits (429) and server errors (5xx)
-  - Immediate failure on non-retryable client errors (400, 401, 403)
-  - Jitter added to backoff to prevent thundering herd
-  - Progress percentage now reflects chunk completion across all batches
-  - Retry attempts displayed to user: "Retrying batch N (attempt X/5)..."
-  - Atomic indexing: all batches succeed or entire operation fails cleanly
-  - Ollama embedder unchanged (local, already fast)
-- **Adaptive Rate Limiting for OpenAI**: Auto-adjusts parallelism based on 429 responses, respects Retry-After headers, optional TPM pacing via `WithOpenAITPMLimit`
-- **Parallel OpenAI Embedding**: 3x+ faster indexing with batched API requests and configurable parallelism (`embedder.parallelism`, default: 4)
+### Added
+
+- **RPG Semantic Graph Layer**: Add RPG semantic graph layer fully integrated into existing APIs (#110) - @tinker495
+- **Workspace Mode**: Add trace, symbol indexing, and watcher fixes for workspace mode (#121) - @jugrajsingh
+  - `grepai trace callers/callees/graph` now supports `--workspace` and `--project` flags for cross-project call graph analysis
+  - `grepai watch --workspace` now extracts symbols and builds per-project call graphs (stored in `.grepai/symbols.gob` per project)
+  - MCP trace tools (`grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`) and `grepai_index_status` support workspace and project parameters
+  - Extracted `trace.SymbolStore` interface from `GOBSymbolStore` for extensibility
+- **Watch Optimization**: Reduce branch-switch reparsing with metadata and symbol hash cache (#123) - @tinker495
+
+### Fixed
+
+- **MCP Windsurf Compatibility**: Add titleFixWriter for Windsurf stdio compatibility (#104) - @cmdaltctr
+- **Update Command**: Fix cross-device link and newline output in `grepai update` (#124) - @hansipie
+- **GOB Store Directory Creation**: GOB stores create missing parent directories on persist (#136) - @tinker495
+- **Call Graph Quality**: Improve callgraph quality and GOB store resilience (#137) - @tinker495
+- **Call Graph Nodes**: Fix caller nodes missing from call graph for incoming edges
+- **Daemon Windows**: Use file-based stop signal on Windows (#140) - @tintop2k
+- **Watcher Event Routing**: Fixed workspace file events being silently dropped due to relative vs absolute path comparison
+
+## [0.30.0] - 2026-02-08
+
+### Added
+
+- **Multi-Worktree Watch and Daemon Support**: Worktree-aware daemon PID management and multi-worktree parallel watching via errgroup (#115) - @tinker495
+  - Worktree-specific PID/ready/log files in daemon package
+  - `discoverWorktreesForWatch()` for automatic linked worktree detection with auto-init
+  - `watchProject()` extracted for single-project watch loop
+  - Platform-specific liveness detection (pipe on Unix, poll on Windows)
+
+### Fixed
+
+- **Lock File Handle Leak**: Fix file handle leak in `WriteWorktreePIDFile` (defer close after lock) (#115) - @tinker495
+- **Deduplicate Watch Loop**: Remove duplicated no-worktree path to use `watchProject()` instead of inline copy (#115) - @tinker495
+
+## [0.29.0] - 2026-02-08
+
+### Added
+
+- **Git Worktree Detection and Auto-Init**: Automatically detect git worktrees and initialize grepai in the main worktree root (#114) - @tinker495
+- **GOB File Locking for Cross-Process Safety**: Add file locking to GOB store to prevent data corruption when multiple processes access the same index (#113) - @tinker495
+
+### Documentation
+
+- **Git Worktree Support Documentation**: Add documentation page for git worktree support (#126) - @yoanbernabeu
+
+## [0.28.0] - 2026-02-07
+
+### Added
+
+- **Ollama/LM Studio Endpoint Prompt**: `grepai init` now prompts for custom Ollama/LM Studio endpoint URL during initialization (#111) - @yoanbernabeu
+- **Content-Addressed Embedding Deduplication**: Skip re-embedding unchanged chunks using content hashing, reducing indexing time and API calls (#112) - @tinker495
+- **Nix Release Automation**: Automate `flake.nix` version and vendorHash update in the release GitHub Actions workflow (#117) - @yoanbernabeu
+
+### Fixed
+
+- **UTF-8 Chunk Boundaries**: Align chunk boundaries to valid UTF-8 rune starts to prevent splitting multi-byte characters (#116) - @yoanbernabeu
+
+## [0.27.0] - 2026-02-04
+
+### Added
+
+- **Non-Interactive Workspace Create**: `workspace create` now supports `--name`, `--backend`, `--embedder-provider`, `--embedder-model`, `--dsn` flags for scripted/CI usage (#100) - @jugrajsingh
+  - Enables fully non-interactive workspace creation without TUI prompts
+  - All required parameters can be passed as CLI flags
+- **MCP Serve Workspace Flag**: `mcp-serve --workspace <name>` to scope MCP tools to a specific workspace (#100) - @jugrajsingh
+  - MCP search and trace tools automatically use the workspace context
+- **Workspace Config Helpers**: `FindWorkspaceConfig()` and `WorkspaceStoreConfig()` in config package for programmatic workspace resolution (#100) - @jugrajsingh
+
+### Documentation
+
+- **Community Tools Page**: New documentation page listing community-built tools and integrations (#101) - @miqcie
+- Updated workspace docs with workspace mode, parallelism tiers, and MCP workspace sections
+- Updated MCP docs with workspace-scoped configuration examples
+- Updated embedders docs with parallelism tier reference
+- Updated watch guide with workspace daemon examples
+
+### Dependencies
+
+- Bump `golang.org/x/sync` from 0.18.0 to 0.19.0 (#99) - @dependabot
+
+## [0.26.0] - 2026-02-01
+
+### Added
+
+- **TOON Format Support**: Add `--toon`/`-t` flag for token-efficient output format (#95) - @yoanbernabeu
+  - TOON (Token-Oriented Object Notation) uses ~50% fewer tokens than JSON in compact mode
+  - Available on `search` and `trace` commands (callers, callees, graph)
+  - MCP tools now support `format` parameter ("json" or "toon")
+  - Flags `--json` and `--toon` are mutually exclusive
+  - `--compact` now works with both `--json` and `--toon`
+
+## [0.25.2] - 2026-02-01
+
+### Fixed
+
+- **Ollama Progress Reporting**: Add visual progress bar for sequential (Ollama) indexing (#94) - @anyeloamt
+  - Previously, embedding progress appeared frozen during Ollama indexing
+  - Now displays a real-time progress bar matching the scan bar style
+  - Fixes confusing UX where users would cancel thinking grepai was broken
+
+## [0.25.1] - 2026-01-31
+
+### Fixed
+
+- **OpenAI Dimensions Parameter**: Only send `dimensions` parameter when explicitly configured (#93) - @yoanbernabeu
+  - Changed `Dimensions` from `int` to `*int` in config to distinguish "not set" from "explicitly set"
+  - OpenAI embedder now omits `dimensions` from API requests when not configured, allowing models to use their native dimensions
+  - Fixes issues with custom OpenAI-compatible endpoints that don't support the `dimensions` parameter
+- **Nix Flake**: Update vendorHash for flake (#90) - @mholtzscher
+
+## [0.25.0] - 2026-01-30
+
+### Added
+
+- **Automatic Re-chunking for Large Chunks**: Automatically split chunks that exceed the embedder's context limit (#88) - @yoanbernabeu
+  - New `ContextLengthError` type for detecting context limit errors from providers (Ollama, OpenAI, LM Studio)
+  - `ReChunk()` method splits oversized chunks into smaller sub-chunks using half the original size
+  - Automatic retry with smaller chunks (up to 3 attempts)
+  - Transparent handling: no configuration changes needed
+  - Fixes "input length exceeds context length" errors when `chunking.size` > model limit
+
+## [0.24.1] - 2026-01-29
+
+### Fixed
+
+- **Symlink Directory Indexing**: Resolve symlinks in `FindProjectRoot()` so that `grepai watch` works correctly when executed from a symlinked directory (#85) - @yoanbernabeu
+
+## [0.24.0] - 2026-01-27
+
+### Added
+
+- **Adaptive Rate Limiting for OpenAI**: Auto-adjusts parallelism based on 429 responses, respects Retry-After headers, optional TPM pacing via `WithOpenAITPMLimit` (#81) - @ariel-frischer
+- **Parallel OpenAI Embedding**: 3x+ faster indexing with batched API requests and configurable parallelism (`embedder.parallelism`, default: 4) (#81) - @ariel-frischer
+  - New `BatchEmbedder` interface for batch processing
+  - Exponential backoff with jitter for retries
+  - Token bucket rate limiting for proactive TPM management
+  - Real-time progress reporting during batch embedding
+>>>>>>> github-real-origin/main
 
 ## [0.23.0] - 2026-01-25
 
@@ -334,11 +440,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.1] - 2026-01-11
 
 ### Documentation
+
 - Simplify Claude Code MCP setup: use `claude mcp add` command instead of manual JSON configuration
 
 ## [0.8.0] - 2026-01-11
 
 ### Added
+
 - **MCP Server Mode**: New `grepai mcp-serve` command for Model Context Protocol integration (#18)
   - Exposes grepai as native MCP tools for AI agents (Claude Code, Cursor, Windsurf, etc.)
   - Available tools: `grepai_search`, `grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`, `grepai_index_status`
@@ -349,6 +457,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.2] - 2026-01-11
 
 ### Documentation
+
 - **Sidebar Reorganization**: Moved "Search Boost" and "Hybrid Search" from Configuration to Features section
 - **Configuration Reference**: Updated full configuration reference with correct field names
   - Added missing options: `version`, `watch.debounce_ms`, `trace.mode`, `trace.enabled_languages`, `trace.exclude_patterns`
@@ -360,6 +469,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.1] - 2026-01-11
 
 ### Added
+
 - **Agent Setup Trace Instructions**: Updated `grepai agent-setup` to include trace command documentation (#16)
   - Added "Call Graph Tracing" section with `trace callers`, `trace callees`, `trace graph` examples
   - All trace examples include `--json` flag for optimal AI agent integration
@@ -368,6 +478,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.0] - 2026-01-10
 
 ### Added
+
 - **Extended Language Support for Trace**: Symbol extraction now supports additional languages
   - C (`.c`, `.h`) - functions, structs, enums, typedefs
   - Zig (`.zig`) - functions, methods (inside structs/enums), inline/export/extern functions, structs, unions, enums, error sets, opaque types, nested types
@@ -378,6 +489,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0] - 2026-01-10
 
 ### Added
+
 - **Search JSON Output**: New `--json`/`-j` flag for `grepai search` command
   - Machine-readable JSON output optimized for AI agents
   - Excludes internal fields (vector, hash, updated_at) to minimize token usage
@@ -387,6 +499,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.0] - 2026-01-10
 
 ### Added
+
 - **Call Graph Tracing**: New `grepai trace` command for code navigation
   - `trace callers <symbol>` - find all functions calling a symbol
   - `trace callees <symbol>` - find all functions called by a symbol
@@ -400,6 +513,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-01-10
 
 ### Added
+
 - **LM Studio Provider**: New local embedding provider using LM Studio
   - Supports OpenAI-compatible API format
   - Configurable endpoint and model selection
@@ -408,6 +522,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-01-09
 
 ### Added
+
 - **Search Boost**: Configurable score multipliers based on file paths
   - Penalize tests, mocks, fixtures, generated files, and docs
   - Boost source directories (`/src/`, `/lib/`, `/app/`)
@@ -421,11 +536,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Feature cards on docs homepage
 
 ### Changed
+
 - Searcher now accepts full SearchConfig instead of just BoostConfig
 
 ## [0.2.0] - 2026-01-09
 
 ### Added
+
 - Initial release of grepai
 - `grepai init` command for project initialization
 - `grepai watch` command for real-time file indexing
@@ -442,15 +559,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform support (macOS, Linux, Windows)
 
 ### Security
+
 - Privacy-first design with local embedding option
 - No telemetry or data collection
 
 ## [0.1.0] - 2026-01-09
 
 ### Added
+
 - Initial public release
 
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/yoanbernabeu/grepai/compare/v0.30.0...v0.31.0
+[0.30.0]: https://github.com/yoanbernabeu/grepai/compare/v0.29.0...v0.30.0
+[0.29.0]: https://github.com/yoanbernabeu/grepai/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/yoanbernabeu/grepai/compare/v0.27.0...v0.28.0
+[0.27.0]: https://github.com/yoanbernabeu/grepai/compare/v0.26.0...v0.27.0
+[0.26.0]: https://github.com/yoanbernabeu/grepai/compare/v0.25.2...v0.26.0
+[0.25.2]: https://github.com/yoanbernabeu/grepai/compare/v0.25.1...v0.25.2
+[0.25.1]: https://github.com/yoanbernabeu/grepai/compare/v0.25.0...v0.25.1
+[0.25.0]: https://github.com/yoanbernabeu/grepai/compare/v0.24.1...v0.25.0
+[0.24.1]: https://github.com/yoanbernabeu/grepai/compare/v0.24.0...v0.24.1
+[0.24.0]: https://github.com/yoanbernabeu/grepai/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/yoanbernabeu/grepai/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/yoanbernabeu/grepai/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/yoanbernabeu/grepai/compare/v0.20.1...v0.21.0
